@@ -1,92 +1,65 @@
-use super::analysis::to_analysed;
-use crate::{
-    primitives::{Address, Bytecode, Bytes, Env, TransactTo, B256, U256},
-    CallInputs,
-};
+use std::sync::Arc;
+use super::analysis::{to_analysed, BytecodeLocked};
+use crate::primitives::{Bytecode, Bytes, B160, U256};
+use crate::CallContext;
+use revm_primitives::{Env, TransactTo};
 
-/// EVM contract information.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Default)]
 pub struct Contract {
     /// Contracts data
     pub input: Bytes,
     /// Bytecode contains contract code, size of original code, analysis with gas block and jump table.
     /// Note that current code is extended with push padding and STOP at end.
-    pub bytecode: Bytecode,
-    /// Bytecode hash for legacy. For EOF this would be None.
-    pub hash: Option<B256>,
-    /// Target address of the account. Storage of this address is going to be modified.
-    pub target_address: Address,
+    pub bytecode: Arc<BytecodeLocked>,
+    /// Contract address
+    pub address: B160,
     /// Caller of the EVM.
-    pub caller: Address,
-    /// Value send to contract from transaction or from CALL opcodes.
-    pub call_value: U256,
+    pub caller: B160,
+    /// Value send to contract.
+    pub value: U256,
+
+    pub code_address: B160,
 }
 
 impl Contract {
-    /// Instantiates a new contract by analyzing the given bytecode.
-    #[inline]
-    pub fn new(
-        input: Bytes,
-        bytecode: Bytecode,
-        hash: Option<B256>,
-        target_address: Address,
-        caller: Address,
-        call_value: U256,
-    ) -> Self {
-        let bytecode = to_analysed(bytecode);
+    pub fn new(input: Bytes, bytecode: Bytecode, address: B160, code_address: B160, caller: B160, value: U256) -> Self {
+        let bytecode = Arc::new(to_analysed(bytecode).try_into().expect("it is analyzed"));
 
         Self {
             input,
+            code_address,
             bytecode,
-            hash,
-            target_address,
+            address,
             caller,
-            call_value,
+            value,
         }
     }
 
-    /// Creates a new contract from the given [`Env`].
-    #[inline]
-    pub fn new_env(env: &Env, bytecode: Bytecode, hash: Option<B256>) -> Self {
-        let contract_address = match env.tx.transact_to {
-            TransactTo::Call(caller) => caller,
-            TransactTo::Create => Address::ZERO,
-        };
-        Self::new(
-            env.tx.data.clone(),
-            bytecode,
-            hash,
-            contract_address,
-            env.tx.caller,
-            env.tx.value,
-        )
+
+    pub fn is_valid_jump(&self, possition: usize) -> bool {
+        self.bytecode.jump_map().is_valid(possition)
     }
 
-    /// Creates a new contract from the given inputs.
-    #[inline]
-    pub fn new_with_context(
-        input: Bytes,
-        bytecode: Bytecode,
-        hash: Option<B256>,
-        call_context: &CallInputs,
-    ) -> Self {
+    pub fn new_with_context(input: Bytes, bytecode: Bytecode, call_context: &CallContext) -> Self {
         Self::new(
             input,
             bytecode,
-            hash,
-            call_context.target_address,
+            call_context.address,
+            call_context.code_address,
             call_context.caller,
-            call_context.call_value(),
+            call_context.apparent_value,
         )
     }
 
-    /// Returns whether the given position is a valid jump destination.
-    #[inline]
-    pub fn is_valid_jump(&self, pos: usize) -> bool {
-        self.bytecode
-            .legacy_jump_table()
-            .map(|i| i.is_valid(pos))
-            .unwrap_or(false)
+
+    pub fn new_with_context_analyzed(input: Bytes, bytecode: Arc<BytecodeLocked>, call_context: &CallContext) -> Self {
+        Self {
+            input,
+            bytecode,
+            code_address: call_context.code_address,
+            address: call_context.address,
+            caller: call_context.caller,
+            value: call_context.apparent_value,
+        }
     }
 }

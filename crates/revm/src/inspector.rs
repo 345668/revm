@@ -1,44 +1,38 @@
-use crate::{
-    interpreter::{CallInputs, CreateInputs, EOFCreateInput, EOFCreateOutcome, Interpreter},
-    primitives::{db::Database, Address, Log, U256},
-    EvmContext,
-};
+use crate::evm_impl::EVMData;
+use crate::interpreter::{CallInputs, CreateInputs, Gas, InstructionResult, Interpreter};
+use crate::primitives::{db::Database, Bytes, B160, B256};
+
 use auto_impl::auto_impl;
 
 #[cfg(feature = "std")]
-mod customprinter;
-#[cfg(all(feature = "std", feature = "serde-json"))]
-mod eip3155;
-mod gas;
-mod handler_register;
-mod noop;
+pub mod customprinter;
+pub mod gas;
+pub mod noop;
+#[cfg(all(feature = "std", feature = "serde"))]
+pub mod tracer_eip3155;
 
-// Exports.
-
-pub use handler_register::{inspector_handle_register, inspector_instruction, GetInspector};
-use revm_interpreter::{CallOutcome, CreateOutcome};
-
-/// [Inspector] implementations.
+/// All Inspectors implementations that revm has.
 pub mod inspectors {
     #[cfg(feature = "std")]
     pub use super::customprinter::CustomPrintTracer;
-    #[cfg(all(feature = "std", feature = "serde-json"))]
-    pub use super::eip3155::TracerEip3155;
     pub use super::gas::GasInspector;
     pub use super::noop::NoOpInspector;
+    #[cfg(all(feature = "std", feature = "serde"))]
+    pub use super::tracer_eip3155::TracerEip3155;
 }
 
-/// EVM [Interpreter] callbacks.
 #[auto_impl(&mut, Box)]
 pub trait Inspector<DB: Database> {
-    /// Called before the interpreter is initialized.
+    /// Called Before the interpreter is initialized.
     ///
-    /// If `interp.instruction_result` is set to anything other than [crate::interpreter::InstructionResult::Continue] then the execution of the interpreter
-    /// is skipped.
-    #[inline]
-    fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut EvmContext<DB>) {
-        let _ = interp;
-        let _ = context;
+    /// If anything other than [InstructionResult::Continue] is returned then execution of the interpreter is
+    /// skipped.
+    fn initialize_interp(
+        &mut self,
+        _interp: &mut Interpreter,
+        _data: &mut EVMData<'_, DB>,
+    ) -> InstructionResult {
+        InstructionResult::Continue
     }
 
     /// Called on each step of the interpreter.
@@ -49,118 +43,94 @@ pub trait Inspector<DB: Database> {
     /// # Example
     ///
     /// To get the current opcode, use `interp.current_opcode()`.
-    #[inline]
-    fn step(&mut self, interp: &mut Interpreter, context: &mut EvmContext<DB>) {
-        let _ = interp;
-        let _ = context;
+    fn step(
+        &mut self,
+        _interp: &mut Interpreter,
+        _data: &mut EVMData<'_, DB>,
+    ) -> InstructionResult {
+        InstructionResult::Continue
+    }
+
+    /// Called when a log is emitted.
+    fn log(
+        &mut self,
+        _evm_data: &mut EVMData<'_, DB>,
+        _address: &B160,
+        _topics: &[B256],
+        _data: &Bytes,
+    ) {
     }
 
     /// Called after `step` when the instruction has been executed.
     ///
-    /// Setting `interp.instruction_result` to anything other than [crate::interpreter::InstructionResult::Continue] alters the execution
-    /// of the interpreter.
-    #[inline]
-    fn step_end(&mut self, interp: &mut Interpreter, context: &mut EvmContext<DB>) {
-        let _ = interp;
-        let _ = context;
-    }
-
-    /// Called when a log is emitted.
-    #[inline]
-    fn log(&mut self, context: &mut EvmContext<DB>, log: &Log) {
-        let _ = context;
-        let _ = log;
+    /// InstructionResulting anything other than [InstructionResult::Continue] alters the execution of the interpreter.
+    fn step_end(
+        &mut self,
+        _interp: &mut Interpreter,
+        _data: &mut EVMData<'_, DB>,
+        _eval: InstructionResult,
+    ) -> InstructionResult {
+        InstructionResult::Continue
     }
 
     /// Called whenever a call to a contract is about to start.
     ///
-    /// InstructionResulting anything other than [crate::interpreter::InstructionResult::Continue] overrides the result of the call.
-    #[inline]
+    /// InstructionResulting anything other than [InstructionResult::Continue] overrides the result of the call.
     fn call(
         &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
-        let _ = context;
-        let _ = inputs;
-        None
+        _data: &mut EVMData<'_, DB>,
+        _inputs: &mut CallInputs,
+    ) -> (InstructionResult, Gas, Bytes) {
+        (InstructionResult::Continue, Gas::new(0), Bytes::new())
     }
 
     /// Called when a call to a contract has concluded.
     ///
-    /// The returned [CallOutcome] is used as the result of the call.
-    ///
-    /// This allows the inspector to modify the given `result` before returning it.
-    #[inline]
+    /// InstructionResulting anything other than the values passed to this function (`(ret, remaining_gas,
+    /// out)`) will alter the result of the call.
     fn call_end(
         &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &CallInputs,
-        outcome: CallOutcome,
-    ) -> CallOutcome {
-        let _ = context;
-        let _ = inputs;
-        outcome
+        _data: &mut EVMData<'_, DB>,
+        _inputs: &CallInputs,
+        remaining_gas: Gas,
+        ret: InstructionResult,
+        out: Bytes,
+    ) -> (InstructionResult, Gas, Bytes) {
+        (ret, remaining_gas, out)
     }
 
     /// Called when a contract is about to be created.
     ///
-    /// If this returns `Some` then the [CreateOutcome] is used to override the result of the creation.
-    ///
-    /// If this returns `None` then the creation proceeds as normal.
-    #[inline]
+    /// InstructionResulting anything other than [InstructionResult::Continue] overrides the result of the creation.
     fn create(
         &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
-        let _ = context;
-        let _ = inputs;
-        None
+        _data: &mut EVMData<'_, DB>,
+        _inputs: &mut CreateInputs,
+    ) -> (InstructionResult, Option<B160>, Gas, Bytes) {
+        (
+            InstructionResult::Continue,
+            None,
+            Gas::new(0),
+            Bytes::default(),
+        )
     }
 
     /// Called when a contract has been created.
     ///
     /// InstructionResulting anything other than the values passed to this function (`(ret, remaining_gas,
     /// address, out)`) will alter the result of the create.
-    #[inline]
     fn create_end(
         &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &CreateInputs,
-        outcome: CreateOutcome,
-    ) -> CreateOutcome {
-        let _ = context;
-        let _ = inputs;
-        outcome
-    }
-
-    fn eofcreate(
-        &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &mut EOFCreateInput,
-    ) -> Option<EOFCreateOutcome> {
-        let _ = context;
-        let _ = inputs;
-        None
-    }
-
-    fn eofcreate_end(
-        &mut self,
-        context: &mut EvmContext<DB>,
-        inputs: &EOFCreateInput,
-        outcome: EOFCreateOutcome,
-    ) -> EOFCreateOutcome {
-        let _ = context;
-        let _ = inputs;
-        outcome
+        _data: &mut EVMData<'_, DB>,
+        _inputs: &CreateInputs,
+        ret: InstructionResult,
+        address: Option<B160>,
+        remaining_gas: Gas,
+        out: Bytes,
+    ) -> (InstructionResult, Option<B160>, Gas, Bytes) {
+        (ret, address, remaining_gas, out)
     }
 
     /// Called when a contract has been self-destructed with funds transferred to target.
-    #[inline]
-    fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        let _ = contract;
-        let _ = target;
-        let _ = value;
-    }
+    fn selfdestruct(&mut self, _contract: B160, _target: B160) {}
 }

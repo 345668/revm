@@ -1,32 +1,30 @@
 use crate::{
-    gas,
-    primitives::{Spec, SpecId::*, U256},
-    Host, Interpreter,
+    gas, interpreter::Interpreter, primitives::Spec, primitives::SpecId::*, Host, InstructionResult,
 };
 
-/// EIP-1344: ChainID opcode
-pub fn chainid<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, ISTANBUL);
+pub fn chainid<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    // EIP-1344: ChainID opcode
+    check!(interpreter, SPEC::enabled(ISTANBUL));
     gas!(interpreter, gas::BASE);
-    push!(interpreter, U256::from(host.env().cfg.chain_id));
+    push!(interpreter, host.env().cfg.chain_id);
 }
 
-pub fn coinbase<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn coinbase<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
-    push_b256!(interpreter, host.env().block.coinbase.into_word());
+    push_b256!(interpreter, host.env().block.coinbase.into());
 }
 
-pub fn timestamp<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn timestamp<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
     push!(interpreter, host.env().block.timestamp);
 }
 
-pub fn block_number<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn number<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
     push!(interpreter, host.env().block.number);
 }
 
-pub fn difficulty<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn difficulty<T, H: Host<T>, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
     gas!(interpreter, gas::BASE);
     if SPEC::enabled(MERGE) {
         push_b256!(interpreter, host.env().block.prevrandao.unwrap());
@@ -35,46 +33,24 @@ pub fn difficulty<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, h
     }
 }
 
-pub fn gaslimit<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn gaslimit<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
     push!(interpreter, host.env().block.gas_limit);
 }
 
-pub fn gasprice<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn gasprice<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
     push!(interpreter, host.env().effective_gas_price());
 }
 
-/// EIP-3198: BASEFEE opcode
-pub fn basefee<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, LONDON);
+pub fn basefee<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
+    // EIP-3198: BASEFEE opcode
+    check!(interpreter, SPEC::enabled(LONDON));
     push!(interpreter, host.env().block.basefee);
 }
 
-pub fn origin<H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn origin<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
-    push_b256!(interpreter, host.env().tx.caller.into_word());
-}
-
-// EIP-4844: Shard Blob Transactions
-pub fn blob_hash<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, CANCUN);
-    gas!(interpreter, gas::VERYLOW);
-    pop_top!(interpreter, index);
-    let i = as_usize_saturated!(index);
-    *index = match host.env().tx.blob_hashes.get(i) {
-        Some(hash) => U256::from_be_bytes(hash.0),
-        None => U256::ZERO,
-    };
-}
-
-/// EIP-7516: BLOBBASEFEE opcode
-pub fn blob_basefee<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, CANCUN);
-    gas!(interpreter, gas::BASE);
-    push!(
-        interpreter,
-        U256::from(host.env().block.get_blob_gasprice().unwrap_or_default())
-    );
+    push_b256!(interpreter, host.env().tx.caller.into());
 }

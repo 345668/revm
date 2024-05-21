@@ -1,15 +1,17 @@
+use anyhow::{Ok, Result};
+use bytes::Bytes;
 use ethers_contract::BaseContract;
 use ethers_core::abi::parse_abi;
 use ethers_providers::{Http, Provider};
 use revm::{
     db::{CacheDB, EmptyDB, EthersDB},
-    primitives::{address, ExecutionResult, Output, TransactTo, U256},
-    Database, Evm,
+    primitives::{ExecutionResult, Output, TransactTo, B160, U256 as rU256},
+    Database, EVM,
 };
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // create ethers client and wrap it in Arc<M>
     let client = Provider::<Http>::try_from(
         "https://mainnet.infura.io/v3/c60b0bb42f8a4c6481ecd229eddaca27",
@@ -29,10 +31,10 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================== //
 
     // choose slot of storage that you would like to transact with
-    let slot = U256::from(8);
+    let slot = rU256::from(8);
 
     // ETH/USDT pair on Uniswap V2
-    let pool_address = address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852");
+    let pool_address = B160::from_str("0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852")?;
 
     // generate abi for the calldata from the human readable interface
     let abi = BaseContract::from(
@@ -65,37 +67,38 @@ async fn main() -> anyhow::Result<()> {
         .unwrap();
 
     // initialise an empty (default) EVM
-    let mut evm = Evm::builder()
-        .with_db(cache_db)
-        .modify_tx_env(|tx| {
-            // fill in missing bits of env struct
-            // change that to whatever caller you want to be
-            tx.caller = address!("0000000000000000000000000000000000000000");
-            // account you want to transact with
-            tx.transact_to = TransactTo::Call(pool_address);
-            // calldata formed via abigen
-            tx.data = encoded.0.into();
-            // transaction value in wei
-            tx.value = U256::from(0);
-        })
-        .build();
+    let mut evm = EVM::new();
+
+    // insert pre-built database from above
+    evm.database(cache_db);
+
+    // fill in missing bits of env struc
+    // change that to whatever caller you want to be
+    evm.env.tx.caller = B160::from_str("0x0000000000000000000000000000000000000000")?;
+    // account you want to transact with
+    evm.env.tx.transact_to = TransactTo::Call(pool_address);
+    // calldata formed via abigen
+    evm.env.tx.data = Bytes::from(hex::decode(hex::encode(&encoded))?);
+    // transaction value in wei
+    evm.env.tx.value = rU256::try_from(0)?;
 
     // execute transaction without writing to the DB
-    let ref_tx = evm.transact().unwrap();
+    let ref_tx = evm.transact_ref().unwrap();
     // select ExecutionResult struct
     let result = ref_tx.result;
 
     // unpack output call enum into raw bytes
     let value = match result {
-        ExecutionResult::Success {
-            output: Output::Call(value),
-            ..
-        } => value,
-        result => panic!("Execution failed: {result:?}"),
+        ExecutionResult::Success { output, .. } => match output {
+            Output::Call(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
     };
 
     // decode bytes to reserves + ts via ethers-rs's abi decode
-    let (reserve0, reserve1, ts): (u128, u128, u32) = abi.decode_output("getReserves", value)?;
+    let (reserve0, reserve1, ts): (u128, u128, u32) =
+        abi.decode_output("getReserves", value.unwrap())?;
 
     // Print emulated getReserves() call output
     println!("Reserve0: {:#?}", reserve0);

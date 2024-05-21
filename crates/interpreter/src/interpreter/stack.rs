@@ -1,218 +1,214 @@
-use crate::{
-    primitives::{B256, U256},
-    InstructionResult,
-};
-use core::{fmt, ptr};
-use std::vec::Vec;
+use crate::primitives::{B256, U256};
+use crate::{alloc::vec::Vec, InstructionResult};
 
-/// EVM interpreter stack limit.
 pub const STACK_LIMIT: usize = 1024;
 
-/// EVM stack with [STACK_LIMIT] capacity of words.
-#[derive(Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+/// EVM stack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Stack {
-    /// The underlying data of the stack.
-    data: Vec<U256>,
+    pub data: Vec<U256>,
 }
 
-impl fmt::Display for Stack {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("[")?;
-        for (i, x) in self.data.iter().enumerate() {
-            if i > 0 {
+#[cfg(feature = "std")]
+impl std::fmt::Display for Stack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.data.is_empty() {
+            f.write_str("[]")?;
+        } else {
+            f.write_str("[")?;
+            for i in self.data[..self.data.len() - 1].iter() {
+                f.write_str(&i.to_string())?;
                 f.write_str(", ")?;
             }
-            write!(f, "{x}")?;
+            f.write_str(&self.data.last().unwrap().to_string())?;
+            f.write_str("]")?;
         }
-        f.write_str("]")
+        Ok(())
     }
 }
 
 impl Default for Stack {
-    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl Stack {
-    /// Instantiate a new stack with the [default stack limit][STACK_LIMIT].
-    #[inline]
+    /// Create a new stack with given limit.
     pub fn new() -> Self {
         Self {
-            // SAFETY: expansion functions assume that capacity is `STACK_LIMIT`.
+            // Safety: A lot of functions assumes that capacity is STACK_LIMIT
             data: Vec::with_capacity(STACK_LIMIT),
         }
     }
 
-    /// Returns the length of the stack in words.
     #[inline]
+    /// Stack length.
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
-    /// Returns whether the stack is empty.
     #[inline]
+    /// Whether the stack is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// Returns a reference to the underlying data buffer.
     #[inline]
+    /// Stack data.
     pub fn data(&self) -> &Vec<U256> {
         &self.data
     }
 
-    /// Returns a mutable reference to the underlying data buffer.
-    #[inline]
-    pub fn data_mut(&mut self) -> &mut Vec<U256> {
-        &mut self.data
+    #[inline(always)]
+    pub fn reduce_one(&mut self) -> Option<InstructionResult> {
+        let len = self.data.len();
+        if len < 1 {
+            return Some(InstructionResult::StackUnderflow);
+        }
+        unsafe {
+            self.data.set_len(len - 1);
+        }
+        None
     }
 
-    /// Consumes the stack and returns the underlying data buffer.
     #[inline]
-    pub fn into_data(self) -> Vec<U256> {
-        self.data
-    }
-
-    /// Removes the topmost element from the stack and returns it, or `StackUnderflow` if it is
-    /// empty.
-    #[inline]
+    /// Pop a value from the stack. If the stack is already empty, returns the
+    /// `StackUnderflow` error.
     pub fn pop(&mut self) -> Result<U256, InstructionResult> {
         self.data.pop().ok_or(InstructionResult::StackUnderflow)
     }
 
-    /// Removes the topmost element from the stack and returns it.
+    #[inline(always)]
+    /// Pops a value from the stack, returning it.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn pop_unsafe(&mut self) -> U256 {
-        self.data.pop().unwrap_unchecked()
+        let mut len = self.data.len();
+        len -= 1;
+        let res = *self.data.get_unchecked(len);
+        self.data.set_len(len);
+        res
     }
 
+    #[inline(always)]
     /// Peeks the top of the stack.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn top_unsafe(&mut self) -> &mut U256 {
         let len = self.data.len();
         self.data.get_unchecked_mut(len - 1)
     }
 
+    #[inline(always)]
     /// Pop the topmost value, returning the value and the new topmost value.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn pop_top_unsafe(&mut self) -> (U256, &mut U256) {
-        let pop = self.pop_unsafe();
-        let top = self.top_unsafe();
-        (pop, top)
+        let mut len = self.data.len();
+        let pop = *self.data.get_unchecked(len - 1);
+        len -= 1;
+        self.data.set_len(len);
+
+        (pop, self.data.get_unchecked_mut(len - 1))
     }
 
-    /// Pops 2 values from the stack.
-    ///
-    /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
-    pub unsafe fn pop2_unsafe(&mut self) -> (U256, U256) {
-        let pop1 = self.pop_unsafe();
-        let pop2 = self.pop_unsafe();
-        (pop1, pop2)
-    }
-
+    #[inline(always)]
     /// Pops 2 values from the stack and returns them, in addition to the new topmost value.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn pop2_top_unsafe(&mut self) -> (U256, U256, &mut U256) {
-        let pop1 = self.pop_unsafe();
-        let pop2 = self.pop_unsafe();
-        let top = self.top_unsafe();
+        let mut len = self.data.len();
+        let pop1 = *self.data.get_unchecked(len - 1);
+        len -= 2;
+        let pop2 = *self.data.get_unchecked(len);
+        self.data.set_len(len);
 
-        (pop1, pop2, top)
+        (pop1, pop2, self.data.get_unchecked_mut(len - 1))
     }
 
+    #[inline(always)]
+    /// Pops 2 values from the stack.
+    ///
+    /// # Safety
+    /// The caller is responsible to check length of array
+    pub unsafe fn pop2_unsafe(&mut self) -> (U256, U256) {
+        let mut len = self.data.len();
+        len -= 2;
+        let res = (
+            *self.data.get_unchecked(len + 1),
+            *self.data.get_unchecked(len),
+        );
+        self.data.set_len(len);
+        res
+    }
+
+    #[inline(always)]
     /// Pops 3 values from the stack.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn pop3_unsafe(&mut self) -> (U256, U256, U256) {
-        let pop1 = self.pop_unsafe();
-        let pop2 = self.pop_unsafe();
-        let pop3 = self.pop_unsafe();
-
-        (pop1, pop2, pop3)
+        let mut len = self.data.len();
+        len -= 3;
+        let res = (
+            *self.data.get_unchecked(len + 2),
+            *self.data.get_unchecked(len + 1),
+            *self.data.get_unchecked(len),
+        );
+        self.data.set_len(len);
+        res
     }
 
+    #[inline(always)]
     /// Pops 4 values from the stack.
     ///
     /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
-    #[inline]
+    /// The caller is responsible to check length of array
     pub unsafe fn pop4_unsafe(&mut self) -> (U256, U256, U256, U256) {
-        let pop1 = self.pop_unsafe();
-        let pop2 = self.pop_unsafe();
-        let pop3 = self.pop_unsafe();
-        let pop4 = self.pop_unsafe();
-
-        (pop1, pop2, pop3, pop4)
+        let mut len = self.data.len();
+        len -= 4;
+        let res = (
+            *self.data.get_unchecked(len + 3),
+            *self.data.get_unchecked(len + 2),
+            *self.data.get_unchecked(len + 1),
+            *self.data.get_unchecked(len),
+        );
+        self.data.set_len(len);
+        res
     }
 
-    /// Pops 5 values from the stack.
-    ///
-    /// # Safety
-    ///
-    /// The caller is responsible for checking the length of the stack.
     #[inline]
-    pub unsafe fn pop5_unsafe(&mut self) -> (U256, U256, U256, U256, U256) {
-        let pop1 = self.pop_unsafe();
-        let pop2 = self.pop_unsafe();
-        let pop3 = self.pop_unsafe();
-        let pop4 = self.pop_unsafe();
-        let pop5 = self.pop_unsafe();
-
-        (pop1, pop2, pop3, pop4, pop5)
-    }
-
     /// Push a new value into the stack. If it will exceed the stack limit,
     /// returns `StackOverflow` error and leaves the stack unchanged.
-    #[inline]
     pub fn push_b256(&mut self, value: B256) -> Result<(), InstructionResult> {
-        self.push(value.into())
+        if self.data.len() + 1 > STACK_LIMIT {
+            return Err(InstructionResult::StackOverflow);
+        }
+        self.data.push(U256::from_be_bytes(value.0));
+        Ok(())
     }
 
-    /// Push a new value onto the stack.
-    ///
-    /// If it will exceed the stack limit, returns `StackOverflow` error and leaves the stack
-    /// unchanged.
     #[inline]
+    /// Push a new value into the stack. If it will exceed the stack limit,
+    /// returns `StackOverflow` error and leaves the stack unchanged.
     pub fn push(&mut self, value: U256) -> Result<(), InstructionResult> {
-        // Allows the compiler to optimize out the `Vec::push` capacity check.
-        assume!(self.data.capacity() == STACK_LIMIT);
-        if self.data.len() == STACK_LIMIT {
+        if self.data.len() + 1 > STACK_LIMIT {
             return Err(InstructionResult::StackOverflow);
         }
         self.data.push(value);
         Ok(())
     }
 
+    #[inline]
     /// Peek a value at given index for the stack, where the top of
     /// the stack is at index `0`. If the index is too large,
     /// `StackError::Underflow` is returned.
-    #[inline]
     pub fn peek(&self, no_from_top: usize) -> Result<U256, InstructionResult> {
         if self.data.len() > no_from_top {
             Ok(self.data[self.data.len() - no_from_top - 1])
@@ -221,139 +217,99 @@ impl Stack {
         }
     }
 
-    /// Duplicates the `N`th value from the top of the stack.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n` is 0.
-    #[inline]
-    #[cfg_attr(debug_assertions, track_caller)]
-    pub fn dup(&mut self, n: usize) -> Result<(), InstructionResult> {
-        assume!(n > 0, "attempted to dup 0");
+    #[inline(always)]
+    pub fn dup<const N: usize>(&mut self) -> Option<InstructionResult> {
         let len = self.data.len();
-        if len < n {
-            Err(InstructionResult::StackUnderflow)
+        if len < N {
+            Some(InstructionResult::StackUnderflow)
         } else if len + 1 > STACK_LIMIT {
-            Err(InstructionResult::StackOverflow)
+            Some(InstructionResult::StackOverflow)
         } else {
-            // SAFETY: check for out of bounds is done above and it makes this safe to do.
+            // Safety: check for out of bounds is done above and it makes this safe to do.
             unsafe {
-                let ptr = self.data.as_mut_ptr().add(len);
-                ptr::copy_nonoverlapping(ptr.sub(n), ptr, 1);
+                *self.data.get_unchecked_mut(len) = *self.data.get_unchecked(len - N);
                 self.data.set_len(len + 1);
             }
-            Ok(())
+            None
         }
     }
 
-    /// Swaps the topmost value with the `N`th value from the top.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n` is 0.
     #[inline(always)]
-    #[cfg_attr(debug_assertions, track_caller)]
-    pub fn swap(&mut self, n: usize) -> Result<(), InstructionResult> {
-        self.exchange(0, n)
-    }
-
-    /// Exchange two values on the stack.
-    ///
-    /// `n` is the first index, and the second index is calculated as `n + m`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `m` is zero.
-    #[inline]
-    #[cfg_attr(debug_assertions, track_caller)]
-    pub fn exchange(&mut self, n: usize, m: usize) -> Result<(), InstructionResult> {
-        assume!(m > 0, "overlapping exchange");
+    pub fn swap<const N: usize>(&mut self) -> Option<InstructionResult> {
         let len = self.data.len();
-        let n_m_index = n + m;
-        if n_m_index >= len {
-            return Err(InstructionResult::StackUnderflow);
+        if len <= N {
+            return Some(InstructionResult::StackUnderflow);
         }
-        // SAFETY: `n` and `n_m` are checked to be within bounds, and they don't overlap.
+        // Safety: length is checked before so we are okay to switch bytes in unsafe way.
         unsafe {
-            // NOTE: `ptr::swap_nonoverlapping` is more efficient than `slice::swap` or `ptr::swap`
-            // because it operates under the assumption that the pointers do not overlap,
-            // eliminating an intemediate copy,
-            // which is a condition we know to be true in this context.
-            let top = self.data.as_mut_ptr().add(len - 1);
-            core::ptr::swap_nonoverlapping(top.sub(n), top.sub(n_m_index), 1);
+            let pa: *mut U256 = self.data.get_unchecked_mut(len - 1);
+            let pb: *mut U256 = self.data.get_unchecked_mut(len - 1 - N);
+            core::ptr::swap(pa, pb);
         }
-        Ok(())
+        None
     }
 
-    /// Pushes an arbitrary length slice of bytes onto the stack, padding the last word with zeros
-    /// if necessary.
-    #[inline]
-    pub fn push_slice(&mut self, slice: &[u8]) -> Result<(), InstructionResult> {
-        if slice.is_empty() {
-            return Ok(());
-        }
-
-        let n_words = (slice.len() + 31) / 32;
-        let new_len = self.data.len() + n_words;
+    /// push slice onto memory it is expected to be max 32 bytes and be contains inside B256
+    #[inline(always)]
+    pub fn push_slice<const N: usize>(&mut self, slice: &[u8]) -> Option<InstructionResult> {
+        let new_len = self.data.len() + 1;
         if new_len > STACK_LIMIT {
-            return Err(InstructionResult::StackOverflow);
+            return Some(InstructionResult::StackOverflow);
         }
 
-        // SAFETY: length checked above.
+        let slot;
+        // Safety: check above ensures us that we are okey in increment len.
         unsafe {
-            let dst = self.data.as_mut_ptr().add(self.data.len()).cast::<u64>();
             self.data.set_len(new_len);
+            slot = self.data.get_unchecked_mut(new_len - 1);
+        }
 
-            let mut i = 0;
-
-            // write full words
-            let words = slice.chunks_exact(32);
-            let partial_last_word = words.remainder();
-            for word in words {
-                // Note: we unroll `U256::from_be_bytes` here to write directly into the buffer,
-                // instead of creating a 32 byte array on the stack and then copying it over.
-                for l in word.rchunks_exact(8) {
-                    dst.add(i).write(u64::from_be_bytes(l.try_into().unwrap()));
-                    i += 1;
+        unsafe {
+            *slot.as_limbs_mut() = [0u64; 4];
+            let mut dangling = [0u8; 8];
+            if N < 8 {
+                dangling[8 - N..].copy_from_slice(slice);
+                slot.as_limbs_mut()[0] = u64::from_be_bytes(dangling);
+            } else if N < 16 {
+                slot.as_limbs_mut()[0] =
+                    u64::from_be_bytes(slice[N - 8..N].try_into().expect("Infallible"));
+                if N != 8 {
+                    dangling[8 * 2 - N..].copy_from_slice(&slice[..N - 8]);
+                    slot.as_limbs_mut()[1] = u64::from_be_bytes(dangling);
+                }
+            } else if N < 24 {
+                slot.as_limbs_mut()[0] =
+                    u64::from_be_bytes(slice[N - 8..N].try_into().expect("Infallible"));
+                slot.as_limbs_mut()[1] =
+                    u64::from_be_bytes(slice[N - 16..N - 8].try_into().expect("Infallible"));
+                if N != 16 {
+                    dangling[8 * 3 - N..].copy_from_slice(&slice[..N - 16]);
+                    slot.as_limbs_mut()[2] = u64::from_be_bytes(dangling);
+                }
+            } else {
+                // M<32
+                slot.as_limbs_mut()[0] =
+                    u64::from_be_bytes(slice[N - 8..N].try_into().expect("Infallible"));
+                slot.as_limbs_mut()[1] =
+                    u64::from_be_bytes(slice[N - 16..N - 8].try_into().expect("Infallible"));
+                slot.as_limbs_mut()[2] =
+                    u64::from_be_bytes(slice[N - 24..N - 16].try_into().expect("Infallible"));
+                if N == 32 {
+                    slot.as_limbs_mut()[3] =
+                        u64::from_be_bytes(slice[..N - 24].try_into().expect("Infallible"));
+                } else if N != 24 {
+                    dangling[8 * 4 - N..].copy_from_slice(&slice[..N - 24]);
+                    slot.as_limbs_mut()[3] = u64::from_be_bytes(dangling);
                 }
             }
-
-            if partial_last_word.is_empty() {
-                return Ok(());
-            }
-
-            // write limbs of partial last word
-            let limbs = partial_last_word.rchunks_exact(8);
-            let partial_last_limb = limbs.remainder();
-            for l in limbs {
-                dst.add(i).write(u64::from_be_bytes(l.try_into().unwrap()));
-                i += 1;
-            }
-
-            // write partial last limb by padding with zeros
-            if !partial_last_limb.is_empty() {
-                let mut tmp = [0u8; 8];
-                tmp[8 - partial_last_limb.len()..].copy_from_slice(partial_last_limb);
-                dst.add(i).write(u64::from_be_bytes(tmp));
-                i += 1;
-            }
-
-            debug_assert_eq!((i + 3) / 4, n_words, "wrote too much");
-
-            // zero out upper bytes of last word
-            let m = i % 4; // 32 / 8
-            if m != 0 {
-                dst.add(i).write_bytes(0, 4 - m);
-            }
         }
-
-        Ok(())
+        None
     }
 
+    #[inline]
     /// Set a value at given index for the stack, where the top of the
     /// stack is at index `0`. If the index is too large,
     /// `StackError::Underflow` is returned.
-    #[inline]
     pub fn set(&mut self, no_from_top: usize, val: U256) -> Result<(), InstructionResult> {
         if self.data.len() > no_from_top {
             let len = self.data.len();
@@ -362,86 +318,5 @@ impl Stack {
         } else {
             Err(InstructionResult::StackUnderflow)
         }
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Stack {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut data = Vec::<U256>::deserialize(deserializer)?;
-        if data.len() > STACK_LIMIT {
-            return Err(serde::de::Error::custom(std::format!(
-                "stack size exceeds limit: {} > {}",
-                data.len(),
-                STACK_LIMIT
-            )));
-        }
-        data.reserve(STACK_LIMIT - data.len());
-        Ok(Self { data })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run(f: impl FnOnce(&mut Stack)) {
-        let mut stack = Stack::new();
-        // fill capacity with non-zero values
-        unsafe {
-            stack.data.set_len(STACK_LIMIT);
-            stack.data.fill(U256::MAX);
-            stack.data.set_len(0);
-        }
-        f(&mut stack);
-    }
-
-    #[test]
-    fn push_slices() {
-        // no-op
-        run(|stack| {
-            stack.push_slice(b"").unwrap();
-            assert_eq!(stack.data, []);
-        });
-
-        // one word
-        run(|stack| {
-            stack.push_slice(&[42]).unwrap();
-            assert_eq!(stack.data, [U256::from(42)]);
-        });
-
-        let n = 0x1111_2222_3333_4444_5555_6666_7777_8888_u128;
-        run(|stack| {
-            stack.push_slice(&n.to_be_bytes()).unwrap();
-            assert_eq!(stack.data, [U256::from(n)]);
-        });
-
-        // more than one word
-        run(|stack| {
-            let b = [U256::from(n).to_be_bytes::<32>(); 2].concat();
-            stack.push_slice(&b).unwrap();
-            assert_eq!(stack.data, [U256::from(n); 2]);
-        });
-
-        run(|stack| {
-            let b = [&[0; 32][..], &[42u8]].concat();
-            stack.push_slice(&b).unwrap();
-            assert_eq!(stack.data, [U256::ZERO, U256::from(42)]);
-        });
-
-        run(|stack| {
-            let b = [&[0; 32][..], &n.to_be_bytes()].concat();
-            stack.push_slice(&b).unwrap();
-            assert_eq!(stack.data, [U256::ZERO, U256::from(n)]);
-        });
-
-        run(|stack| {
-            let b = [&[0; 64][..], &n.to_be_bytes()].concat();
-            stack.push_slice(&b).unwrap();
-            assert_eq!(stack.data, [U256::ZERO, U256::ZERO, U256::from(n)]);
-        });
     }
 }

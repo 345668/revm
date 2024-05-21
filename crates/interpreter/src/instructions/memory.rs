@@ -1,42 +1,46 @@
-use crate::{
-    gas,
-    primitives::{Spec, U256},
-    Host, Interpreter,
-};
-use core::cmp::max;
+use std::cmp::max;
 
-pub fn mload<H: Host + ?Sized>(interpreter: &mut Interpreter, _host: &mut H) {
+use crate::{gas, interpreter::Interpreter, primitives::U256, Host, InstructionResult};
+
+pub fn mload<T>(interpreter: &mut Interpreter, _host: &mut dyn Host<T>) {
     gas!(interpreter, gas::VERYLOW);
-    pop_top!(interpreter, top);
-    let offset = as_usize_or_fail!(interpreter, top);
-    resize_memory!(interpreter, offset, 32);
-    *top = interpreter.shared_memory.get_u256(offset);
+    pop!(interpreter, index);
+    let index = as_usize_or_fail!(interpreter, index, InstructionResult::InvalidOperandOOG);
+    memory_resize!(interpreter, index, 32);
+    push!(
+        interpreter,
+        U256::from_be_bytes::<{ U256::BYTES }>(
+            interpreter.memory.get_slice(index, 32).try_into().unwrap()
+        )
+    );
 }
 
-pub fn mstore<H: Host + ?Sized>(interpreter: &mut Interpreter, _host: &mut H) {
+pub fn mstore<T>(interpreter: &mut Interpreter, _host: &mut dyn Host<T>) {
     gas!(interpreter, gas::VERYLOW);
-    pop!(interpreter, offset, value);
-    let offset = as_usize_or_fail!(interpreter, offset);
-    resize_memory!(interpreter, offset, 32);
-    interpreter.shared_memory.set_u256(offset, value);
+    pop!(interpreter, index, value);
+    let index = as_usize_or_fail!(interpreter, index, InstructionResult::InvalidOperandOOG);
+    memory_resize!(interpreter, index, 32);
+    interpreter.memory.set_u256(index, value);
 }
 
-pub fn mstore8<H: Host + ?Sized>(interpreter: &mut Interpreter, _host: &mut H) {
+pub fn mstore8<T>(interpreter: &mut Interpreter, _host: &mut dyn Host<T>) {
     gas!(interpreter, gas::VERYLOW);
-    pop!(interpreter, offset, value);
-    let offset = as_usize_or_fail!(interpreter, offset);
-    resize_memory!(interpreter, offset, 1);
-    interpreter.shared_memory.set_byte(offset, value.byte(0))
+    pop!(interpreter, index, value);
+    let index = as_usize_or_fail!(interpreter, index, InstructionResult::InvalidOperandOOG);
+    memory_resize!(interpreter, index, 1);
+    let value = value.as_le_bytes()[0];
+    // Safety: we resized our memory two lines above.
+    unsafe { interpreter.memory.set_byte(index, value) }
 }
 
-pub fn msize<H: Host + ?Sized>(interpreter: &mut Interpreter, _host: &mut H) {
+pub fn msize<T>(interpreter: &mut Interpreter, _host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BASE);
-    push!(interpreter, U256::from(interpreter.shared_memory.len()));
+    push!(interpreter, U256::from(interpreter.memory.effective_len()));
 }
 
 // EIP-5656: MCOPY - Memory copying instruction
-pub fn mcopy<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, _host: &mut H) {
-    check!(interpreter, CANCUN);
+pub fn mcopy<T>(interpreter: &mut Interpreter, _host: &mut dyn Host<T>) {
+    // check!(interpreter, SPEC::enabled(CANCUN));
     pop!(interpreter, dst, src, len);
 
     // into usize or fail
@@ -50,7 +54,8 @@ pub fn mcopy<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, _host:
     let dst = as_usize_or_fail!(interpreter, dst);
     let src = as_usize_or_fail!(interpreter, src);
     // resize memory
-    resize_memory!(interpreter, max(dst, src), len);
+    memory_resize!(interpreter, max(dst, src), len);
     // copy memory in place
-    interpreter.shared_memory.copy(dst, src, len);
+    // interpreter.shared_memory.copy(dst, src, len);
+    interpreter.memory.copy(dst, src, len);
 }

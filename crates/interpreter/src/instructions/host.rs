@@ -1,25 +1,27 @@
+use crate::primitives::{Bytes, Spec, SpecId::*, B160, B256, U256};
+use crate::MAX_INITCODE_SIZE;
 use crate::{
-    gas::{self, warm_cold_cost},
+    alloc::vec::Vec,
+    gas::{self, COLD_ACCOUNT_ACCESS_COST, WARM_STORAGE_READ_COST},
     interpreter::Interpreter,
-    primitives::{Bytes, Log, LogData, Spec, SpecId::*, B256, U256},
-    Host, InstructionResult, SStoreResult,
+    return_ok, return_revert, CallContext, CallInputs, CallScheme, CreateInputs, CreateScheme,
+    Host, InstructionResult, Transfer,
 };
 use core::cmp::min;
-use std::vec::Vec;
 
-pub fn balance<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn balance<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     pop_address!(interpreter, address);
-    let Some((balance, is_cold)) = host.balance(address) else {
+    let ret = host.balance(address);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (balance, is_cold) = ret.unwrap();
     gas!(
         interpreter,
-        if SPEC::enabled(BERLIN) {
-            warm_cold_cost(is_cold)
-        } else if SPEC::enabled(ISTANBUL) {
+        if SPEC::enabled(ISTANBUL) {
             // EIP-1884: Repricing for trie-size-dependent opcodes
-            700
+            gas::account_access_gas::<SPEC>(is_cold)
         } else if SPEC::enabled(TANGERINE) {
             400
         } else {
@@ -29,25 +31,36 @@ pub fn balance<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host
     push!(interpreter, balance);
 }
 
-/// EIP-1884: Repricing for trie-size-dependent opcodes
-pub fn selfbalance<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, ISTANBUL);
+pub fn selfbalance<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    // EIP-1884: Repricing for trie-size-dependent opcodes
+    check!(interpreter, SPEC::enabled(ISTANBUL));
     gas!(interpreter, gas::LOW);
-    let Some((balance, _)) = host.balance(interpreter.contract.target_address) else {
+    let ret = host.balance(interpreter.contract.address);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (balance, _) = ret.unwrap();
     push!(interpreter, balance);
 }
 
-pub fn extcodesize<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn extcodesize<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     pop_address!(interpreter, address);
-    let Some((code, is_cold)) = host.code(address) else {
+    let ret = host.code(address);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (code, is_cold) = ret.unwrap();
     if SPEC::enabled(BERLIN) {
-        gas!(interpreter, warm_cold_cost(is_cold));
+        gas!(
+            interpreter,
+            if is_cold {
+                COLD_ACCOUNT_ACCESS_COST
+            } else {
+                WARM_STORAGE_READ_COST
+            }
+        );
     } else if SPEC::enabled(TANGERINE) {
         gas!(interpreter, 700);
     } else {
@@ -57,16 +70,24 @@ pub fn extcodesize<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, 
     push!(interpreter, U256::from(code.len()));
 }
 
-/// EIP-1052: EXTCODEHASH opcode
-pub fn extcodehash<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, CONSTANTINOPLE);
+pub fn extcodehash<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check!(interpreter, SPEC::enabled(CONSTANTINOPLE)); // EIP-1052: EXTCODEHASH opcode
     pop_address!(interpreter, address);
-    let Some((code_hash, is_cold)) = host.code_hash(address) else {
+    let ret = host.code_hash(address);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (code_hash, is_cold) = ret.unwrap();
     if SPEC::enabled(BERLIN) {
-        gas!(interpreter, warm_cold_cost(is_cold));
+        gas!(
+            interpreter,
+            if is_cold {
+                COLD_ACCOUNT_ACCESS_COST
+            } else {
+                WARM_STORAGE_READ_COST
+            }
+        );
     } else if SPEC::enabled(ISTANBUL) {
         gas!(interpreter, 700);
     } else {
@@ -75,149 +96,478 @@ pub fn extcodehash<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, 
     push_b256!(interpreter, code_hash);
 }
 
-pub fn extcodecopy<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn extcodecopy<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     pop_address!(interpreter, address);
     pop!(interpreter, memory_offset, code_offset, len_u256);
 
-    let Some((code, is_cold)) = host.code(address) else {
+    let ret = host.code(address);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (code, is_cold) = ret.unwrap();
 
-    let len = as_usize_or_fail!(interpreter, len_u256);
+    let len = as_usize_or_fail!(interpreter, len_u256, InstructionResult::InvalidOperandOOG);
     gas_or_fail!(
         interpreter,
-        gas::extcodecopy_cost(SPEC::SPEC_ID, len as u64, is_cold)
+        gas::extcodecopy_cost::<SPEC>(len as u64, is_cold)
     );
     if len == 0 {
         return;
     }
-    let memory_offset = as_usize_or_fail!(interpreter, memory_offset);
+    let memory_offset = as_usize_or_fail!(
+        interpreter,
+        memory_offset,
+        InstructionResult::InvalidOperandOOG
+    );
     let code_offset = min(as_usize_saturated!(code_offset), code.len());
-    resize_memory!(interpreter, memory_offset, len);
+    memory_resize!(interpreter, memory_offset, len);
 
-    // Note: this can't panic because we resized memory to fit.
+    // Safety: set_data is unsafe function and memory_resize ensures us that it is safe to call it
     interpreter
-        .shared_memory
-        .set_data(memory_offset, code_offset, len, &code.original_bytes());
+        .memory
+        .set_data(memory_offset, code_offset, len, code.bytecode());
 }
 
-pub fn blockhash<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
+pub fn blockhash<T>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
     gas!(interpreter, gas::BLOCKHASH);
     pop_top!(interpreter, number);
 
-    let block_number = host.env().block.number;
-    let Some(hash) = host.block_hash(block_number) else {
-        interpreter.instruction_result = InstructionResult::FatalExternalError;
-        return;
-    };
-    *number = U256::from_be_bytes(hash.0);
+    if let Some(diff) = host.env().block.number.checked_sub(*number) {
+        let diff = as_usize_saturated!(diff);
+        // blockhash should push zero if number is same as current block number.
+        if diff <= 256 && diff != 0 {
+            let ret = host.block_hash(*number);
+            if ret.is_none() {
+                interpreter.instruction_result = InstructionResult::FatalExternalError;
+                return;
+            }
+            *number = U256::from_be_bytes(*ret.unwrap());
+            return;
+        }
+    }
+    *number = U256::ZERO;
 }
 
-pub fn sload<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    pop_top!(interpreter, index);
-    let Some((value, is_cold)) = host.sload(interpreter.contract.target_address, *index) else {
+pub fn sload<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    pop!(interpreter, index);
+
+    let ret = host.sload(interpreter.contract.address, index);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
-    gas!(interpreter, gas::sload_cost(SPEC::SPEC_ID, is_cold));
-    *index = value;
+    }
+    let (value, is_cold) = ret.unwrap();
+    gas!(interpreter, gas::sload_cost::<SPEC>(is_cold));
+    push!(interpreter, value);
 }
 
-pub fn sstore<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    require_non_staticcall!(interpreter);
+pub fn sstore<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check_staticcall!(interpreter);
 
     pop!(interpreter, index, value);
-    let Some(SStoreResult {
-        original_value: original,
-        present_value: old,
-        new_value: new,
-        is_cold,
-    }) = host.sstore(interpreter.contract.target_address, index, value)
-    else {
+    let ret = host.sstore(interpreter.contract.address, index, value);
+    if ret.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let (original, old, new, is_cold) = ret.unwrap();
     gas_or_fail!(interpreter, {
         let remaining_gas = interpreter.gas.remaining();
-        gas::sstore_cost(SPEC::SPEC_ID, original, old, new, remaining_gas, is_cold)
+        gas::sstore_cost::<SPEC>(original, old, new, remaining_gas, is_cold)
     });
-    refund!(
-        interpreter,
-        gas::sstore_refund(SPEC::SPEC_ID, original, old, new)
-    );
+    refund!(interpreter, gas::sstore_refund::<SPEC>(original, old, new));
 }
 
 /// EIP-1153: Transient storage opcodes
 /// Store value to transient storage
-pub fn tstore<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, CANCUN);
-    require_non_staticcall!(interpreter);
+pub fn tstore<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check!(interpreter, SPEC::enabled(CANCUN));
+    check_staticcall!(interpreter);
     gas!(interpreter, gas::WARM_STORAGE_READ_COST);
 
     pop!(interpreter, index, value);
 
-    host.tstore(interpreter.contract.target_address, index, value);
+    host.tstore(interpreter.contract.address, index, value);
 }
 
 /// EIP-1153: Transient storage opcodes
 /// Load value from transient storage
-pub fn tload<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    check!(interpreter, CANCUN);
+pub fn tload<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check!(interpreter, SPEC::enabled(CANCUN));
     gas!(interpreter, gas::WARM_STORAGE_READ_COST);
 
     pop_top!(interpreter, index);
 
-    *index = host.tload(interpreter.contract.target_address, *index);
+    *index = host.tload(interpreter.contract.address, *index);
 }
 
-pub fn log<const N: usize, H: Host + ?Sized>(interpreter: &mut Interpreter, host: &mut H) {
-    require_non_staticcall!(interpreter);
+pub fn log<T, const N: u8>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check_staticcall!(interpreter);
 
     pop!(interpreter, offset, len);
-    let len = as_usize_or_fail!(interpreter, len);
-    gas_or_fail!(interpreter, gas::log_cost(N as u8, len as u64));
+    let len = as_usize_or_fail!(interpreter, len, InstructionResult::InvalidOperandOOG);
+    gas_or_fail!(interpreter, gas::log_cost(N, len as u64));
     let data = if len == 0 {
         Bytes::new()
     } else {
-        let offset = as_usize_or_fail!(interpreter, offset);
-        resize_memory!(interpreter, offset, len);
-        Bytes::copy_from_slice(interpreter.shared_memory.slice(offset, len))
+        let offset = as_usize_or_fail!(interpreter, offset, InstructionResult::InvalidOperandOOG);
+        memory_resize!(interpreter, offset, len);
+        Bytes::copy_from_slice(interpreter.memory.get_slice(offset, len))
     };
-
-    if interpreter.stack.len() < N {
+    let n = N as usize;
+    if interpreter.stack.len() < n {
         interpreter.instruction_result = InstructionResult::StackUnderflow;
         return;
     }
 
-    let mut topics = Vec::with_capacity(N);
-    for _ in 0..N {
-        // SAFETY: stack bounds already checked few lines above
-        topics.push(B256::from(unsafe { interpreter.stack.pop_unsafe() }));
+    let mut topics = Vec::with_capacity(n);
+    for _ in 0..(n) {
+        // Safety: stack bounds already checked few lines above
+        topics.push(B256(unsafe {
+            interpreter.stack.pop_unsafe().to_be_bytes()
+        }));
     }
 
-    let log = Log {
-        address: interpreter.contract.target_address,
-        data: LogData::new(topics, data).expect("LogData should have <=4 topics"),
-    };
-
-    host.log(log);
+    host.log(interpreter.contract.address, topics, data);
 }
 
-pub fn selfdestruct<H: Host + ?Sized, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut H) {
-    require_non_staticcall!(interpreter);
+pub fn selfdestruct<T, SPEC: Spec>(interpreter: &mut Interpreter, host: &mut dyn Host<T>) {
+    check_staticcall!(interpreter);
     pop_address!(interpreter, target);
 
-    let Some(res) = host.selfdestruct(interpreter.contract.target_address, target) else {
+    let res = host.selfdestruct(interpreter.contract.address, target);
+    if res.is_none() {
         interpreter.instruction_result = InstructionResult::FatalExternalError;
         return;
-    };
+    }
+    let res = res.unwrap();
 
     // EIP-3529: Reduction in refunds
     if !SPEC::enabled(LONDON) && !res.previously_destroyed {
         refund!(interpreter, gas::SELFDESTRUCT)
     }
-    gas!(interpreter, gas::selfdestruct_cost(SPEC::SPEC_ID, res));
+    gas!(interpreter, gas::selfdestruct_cost::<SPEC>(res));
 
     interpreter.instruction_result = InstructionResult::SelfDestruct;
+}
+
+pub fn create<T, const IS_CREATE2: bool, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    check_staticcall!(interpreter);
+    if IS_CREATE2 {
+        // EIP-1014: Skinny CREATE2
+        check!(interpreter, SPEC::enabled(PETERSBURG));
+    }
+
+    interpreter.return_data_buffer = Bytes::new();
+
+    pop!(interpreter, value, code_offset, len);
+    let len = as_usize_or_fail!(interpreter, len, InstructionResult::InvalidOperandOOG);
+
+    let code = if len == 0 {
+        Bytes::new()
+    } else {
+        let code_offset = as_usize_or_fail!(
+            interpreter,
+            code_offset,
+            InstructionResult::InvalidOperandOOG
+        );
+        // EIP-3860: Limit and meter initcode
+        if SPEC::enabled(SHANGHAI) {
+            if len > MAX_INITCODE_SIZE {
+                interpreter.instruction_result = InstructionResult::CreateInitcodeSizeLimit;
+                return;
+            }
+            gas!(interpreter, gas::initcode_cost(len as u64));
+        }
+        memory_resize!(interpreter, code_offset, len);
+        Bytes::copy_from_slice(interpreter.memory.get_slice(code_offset, len))
+    };
+
+    let scheme = if IS_CREATE2 {
+        pop!(interpreter, salt);
+        gas_or_fail!(interpreter, gas::create2_cost(len));
+        CreateScheme::Create2 { salt }
+    } else {
+        gas!(interpreter, gas::CREATE);
+        CreateScheme::Create
+    };
+
+    let mut gas_limit = interpreter.gas().remaining();
+
+    // EIP-150: Gas cost changes for IO-heavy operations
+    if SPEC::enabled(TANGERINE) {
+        // take remaining gas and deduce l64 part of it.
+        gas_limit -= gas_limit / 64
+    }
+    gas!(interpreter, gas_limit);
+
+    let mut create_input = CreateInputs {
+        caller: interpreter.contract.address,
+        scheme,
+        value,
+        init_code: code,
+        gas_limit,
+    };
+
+    let (return_reason, address, gas, return_data) =
+        host.create(&mut create_input, additional_data);
+    interpreter.return_data_buffer = match return_reason {
+        // Save data to return data buffer if the create reverted
+        return_revert!() => return_data,
+        // Otherwise clear it
+        _ => Bytes::new(),
+    };
+
+    match return_reason {
+        return_ok!() => {
+            push_b256!(interpreter, address.unwrap_or_default().into());
+            if crate::USE_GAS {
+                interpreter.gas.erase_cost(gas.remaining());
+                interpreter.gas.record_refund(gas.refunded());
+            }
+        }
+        return_revert!() => {
+            push_b256!(interpreter, B256::zero());
+            if crate::USE_GAS {
+                interpreter.gas.erase_cost(gas.remaining());
+            }
+        }
+        InstructionResult::FatalExternalError => {
+            interpreter.instruction_result = InstructionResult::FatalExternalError;
+        }
+        _ => {
+            push_b256!(interpreter, B256::zero());
+        }
+    }
+}
+
+pub fn call<T, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    call_inner::<T, SPEC>(interpreter, CallScheme::Call, host, additional_data);
+}
+
+pub fn call_code<T, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    call_inner::<T, SPEC>(interpreter, CallScheme::CallCode, host, additional_data);
+}
+
+pub fn delegate_call<T, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    call_inner::<T, SPEC>(interpreter, CallScheme::DelegateCall, host, additional_data);
+}
+
+pub fn static_call<T, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    call_inner::<T, SPEC>(interpreter, CallScheme::StaticCall, host, additional_data);
+}
+
+pub fn call_inner<T, SPEC: Spec>(
+    interpreter: &mut Interpreter,
+    scheme: CallScheme,
+    host: &mut dyn Host<T>,
+    additional_data: &mut T,
+) {
+    match scheme {
+        CallScheme::DelegateCall => check!(interpreter, SPEC::enabled(HOMESTEAD)), // EIP-7: DELEGATECALL
+        CallScheme::StaticCall => check!(interpreter, SPEC::enabled(BYZANTIUM)), // EIP-214: New opcode STATICCALL
+        _ => (),
+    }
+    interpreter.return_data_buffer = Bytes::new();
+
+    pop!(interpreter, local_gas_limit);
+    pop_address!(interpreter, to);
+    let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
+
+    let value = match scheme {
+        CallScheme::CallCode => {
+            pop!(interpreter, value);
+            value
+        }
+        CallScheme::Call => {
+            pop!(interpreter, value);
+            if interpreter.is_static && value != U256::ZERO {
+                interpreter.instruction_result = InstructionResult::CallNotAllowedInsideStatic;
+                return;
+            }
+            value
+        }
+        CallScheme::DelegateCall | CallScheme::StaticCall => U256::ZERO,
+    };
+
+    pop!(interpreter, in_offset, in_len, out_offset, out_len);
+
+    let in_len = as_usize_or_fail!(interpreter, in_len, InstructionResult::InvalidOperandOOG);
+    let input = if in_len != 0 {
+        let in_offset =
+            as_usize_or_fail!(interpreter, in_offset, InstructionResult::InvalidOperandOOG);
+        memory_resize!(interpreter, in_offset, in_len);
+        Bytes::copy_from_slice(interpreter.memory.get_slice(in_offset, in_len))
+    } else {
+        Bytes::new()
+    };
+
+    let out_len = as_usize_or_fail!(interpreter, out_len, InstructionResult::InvalidOperandOOG);
+    let out_offset = if out_len != 0 {
+        let out_offset = as_usize_or_fail!(
+            interpreter,
+            out_offset,
+            InstructionResult::InvalidOperandOOG
+        );
+        memory_resize!(interpreter, out_offset, out_len);
+        out_offset
+    } else {
+        usize::MAX //unrealistic value so we are sure it is not used
+    };
+
+    let context = match scheme {
+        CallScheme::Call | CallScheme::StaticCall => CallContext {
+            address: to,
+            caller: interpreter.contract.address,
+            code_address: to,
+            apparent_value: value,
+            scheme,
+        },
+        CallScheme::CallCode => CallContext {
+            address: interpreter.contract.address,
+            caller: interpreter.contract.address,
+            code_address: to,
+            apparent_value: value,
+            scheme,
+        },
+        CallScheme::DelegateCall => CallContext {
+            address: interpreter.contract.address,
+            caller: interpreter.contract.caller,
+            code_address: to,
+            apparent_value: interpreter.contract.value,
+            scheme,
+        },
+    };
+
+    let transfer = if scheme == CallScheme::Call {
+        Transfer {
+            source: interpreter.contract.address,
+            target: to,
+            value,
+        }
+    } else if scheme == CallScheme::CallCode {
+        Transfer {
+            source: interpreter.contract.address,
+            target: interpreter.contract.address,
+            value,
+        }
+    } else {
+        //this is dummy send for StaticCall and DelegateCall, it should do nothing and dont touch anything.
+        Transfer {
+            source: interpreter.contract.address,
+            target: interpreter.contract.address,
+            value: U256::ZERO,
+        }
+    };
+
+    // load account and calculate gas cost.
+    let res = host.load_account(to);
+    if res.is_none() {
+        interpreter.instruction_result = InstructionResult::FatalExternalError;
+        return;
+    }
+    let (is_cold, exist) = res.unwrap();
+    let is_new = !exist;
+
+    gas!(
+        interpreter,
+        gas::call_cost::<SPEC>(
+            value,
+            is_new,
+            is_cold,
+            matches!(scheme, CallScheme::Call | CallScheme::CallCode),
+            matches!(scheme, CallScheme::Call | CallScheme::StaticCall),
+        )
+    );
+
+    // take l64 part of gas_limit
+    let mut gas_limit = if SPEC::enabled(TANGERINE) {
+        //EIP-150: Gas cost changes for IO-heavy operations
+        let gas = interpreter.gas().remaining();
+        min(gas - gas / 64, local_gas_limit)
+    } else {
+        local_gas_limit
+    };
+
+    gas!(interpreter, gas_limit);
+
+    // add call stipend if there is value to be transferred.
+    if matches!(scheme, CallScheme::Call | CallScheme::CallCode) && transfer.value != U256::ZERO {
+        gas_limit = gas_limit.saturating_add(gas::CALL_STIPEND);
+    }
+    let is_static = matches!(scheme, CallScheme::StaticCall) || interpreter.is_static;
+
+    let mut call_input = CallInputs {
+        contract: to,
+        transfer,
+        input,
+        gas_limit,
+        context,
+        is_static,
+    };
+
+    // Call host to interuct with target contract
+    let (reason, gas, return_data) = host.call(
+        &mut call_input,
+        interpreter,
+        (out_offset, out_len),
+        additional_data,
+    );
+
+    interpreter.return_data_buffer = return_data;
+
+    let target_len = min(out_len, interpreter.return_data_buffer.len());
+
+    match reason {
+        return_ok!() => {
+            // return unspend gas.
+            if crate::USE_GAS {
+                interpreter.gas.erase_cost(gas.remaining());
+                interpreter.gas.record_refund(gas.refunded());
+            }
+            interpreter
+                .memory
+                .set(out_offset, &interpreter.return_data_buffer[..target_len]);
+            push!(interpreter, U256::from(1));
+        }
+        return_revert!() => {
+            if crate::USE_GAS {
+                interpreter.gas.erase_cost(gas.remaining());
+            }
+            interpreter
+                .memory
+                .set(out_offset, &interpreter.return_data_buffer[..target_len]);
+            push!(interpreter, U256::ZERO);
+        }
+        InstructionResult::FatalExternalError
+        | InstructionResult::ControlLeak
+        | InstructionResult::ArbitraryExternalCallAddressBounded(_, _, _)
+        | InstructionResult::AddressUnboundedStaticCall => {
+            interpreter.instruction_result = reason;
+        }
+        _ => {
+            push!(interpreter, U256::ZERO);
+        }
+    }
 }

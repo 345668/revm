@@ -1,447 +1,186 @@
 pub mod analysis;
 mod contract;
-#[cfg(feature = "serde")]
-pub mod serde;
-mod shared_memory;
+pub(crate) mod memory;
 mod stack;
 
+pub use analysis::BytecodeLocked;
 pub use contract::Contract;
-pub use shared_memory::{num_words, SharedMemory, EMPTY_SHARED_MEMORY};
-pub use stack::{Stack, STACK_LIMIT};
+pub use memory::Memory;
+pub use stack::Stack;
 
-use crate::EOFCreateOutcome;
+use crate::primitives::{Bytes, Spec};
 use crate::{
-    gas, primitives::Bytes, push, push_b256, return_ok, return_revert, CallOutcome, CreateOutcome,
-    FunctionStack, Gas, Host, InstructionResult, InterpreterAction,
+    instructions::{eval, InstructionResult},
+    Gas, Host,
 };
-use core::cmp::min;
-use revm_primitives::{Bytecode, Eof, U256};
-use std::borrow::ToOwned;
+use core::ops::Range;
 
-/// EVM bytecode interpreter.
-#[derive(Debug)]
+pub const STACK_LIMIT: u64 = 1024;
+pub const CALL_STACK_LIMIT: u64 = 1024;
+
+// This is a carefully considered value. Eg. very complex tx:
+// https://bscscan.com/tx/0xae8ca9dc8258ae32899fe641985739c3fa53ab1f603973ac74b424e165c66ccf whose instruction count is 4_752_748
+// https://bscscan.com/tx/0x3b472f87431a52082bae7d8524b4e0af3cf930a105646259e1249f2218525607 whose instruction count is 2_230_341
+pub const MAX_INSTRUCTION_SIZE: usize = 8_000_000;
+
+/// EIP-170: Contract code size limit
+/// By default limit is 0x6000 (~25kb)
+pub const MAX_CODE_SIZE: usize = 0x6000;
+/// EIP-3860: Limit and meter initcode
+pub const MAX_INITCODE_SIZE: usize = 2 * MAX_CODE_SIZE;
+
 pub struct Interpreter {
-    /// The current instruction pointer.
+    /// Instruction pointer.
     pub instruction_pointer: *const u8,
-    /// The gas state.
-    pub gas: Gas,
-    /// Contract information and invoking data
-    pub contract: Contract,
-    /// The execution control flag. If this is not set to `Continue`, the interpreter will stop
-    /// execution.
+    /// Return is main control flag, it tell us if we should continue interpreter or break from it
     pub instruction_result: InstructionResult,
-    /// Currently run Bytecode that instruction result will point to.
-    /// Bytecode is owned by the contract.
-    pub bytecode: Bytes,
-    /// Whether we are Interpreting the Ethereum Object Format (EOF) bytecode.
-    /// This is local field that is set from `contract.is_eof()`.
-    pub is_eof: bool,
-    /// Is init flag for eof create
-    pub is_eof_init: bool,
-    /// Shared memory.
-    ///
-    /// Note: This field is only set while running the interpreter loop.
-    /// Otherwise it is taken and replaced with empty shared memory.
-    pub shared_memory: SharedMemory,
+    /// left gas. Memory gas can be found in Memory field.
+    pub gas: Gas,
+    /// Memory.
+    pub memory: Memory,
     /// Stack.
     pub stack: Stack,
-    /// EOF function stack.
-    pub function_stack: FunctionStack,
-    /// The return data buffer for internal calls.
-    /// It has multi usage:
-    ///
-    /// * It contains the output bytes of call sub call.
-    /// * When this interpreter finishes execution it contains the output bytes of this contract.
+    /// After call returns, its return data is saved here.
     pub return_data_buffer: Bytes,
-    /// Whether the interpreter is in "staticcall" mode, meaning no state changes can happen.
+    /// Return value.
+    pub return_range: Range<usize>,
+    /// Is interpreter call static.
     pub is_static: bool,
-    /// Actions that the EVM should do.
-    ///
-    /// Set inside CALL or CREATE instructions and RETURN or REVERT instructions. Additionally those instructions will set
-    /// InstructionResult to CallOrCreate/Return/Revert so we know the reason.
-    pub next_action: InterpreterAction,
-}
-
-impl Default for Interpreter {
-    fn default() -> Self {
-        Self::new(Contract::default(), 0, false)
-    }
-}
-
-/// The result of an interpreter operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
-pub struct InterpreterResult {
-    /// The result of the instruction execution.
-    pub result: InstructionResult,
-    /// The output of the instruction execution.
-    pub output: Bytes,
-    /// The gas usage information.
-    pub gas: Gas,
+    /// Contract information and invoking data
+    pub contract: Contract,
+    /// Memory limit. See [`crate::CfgEnv`].
+    #[cfg(feature = "memory_limit")]
+    pub memory_limit: u64,
 }
 
 impl Interpreter {
-    /// Create new interpreter
-    pub fn new(contract: Contract, gas_limit: u64, is_static: bool) -> Self {
-        if !contract.bytecode.is_execution_ready() {
-            panic!("Contract is not execution ready {:?}", contract.bytecode);
-        }
-        let is_eof = contract.bytecode.is_eof();
-        let bytecode = contract.bytecode.bytecode().clone();
-        Self {
-            instruction_pointer: bytecode.as_ptr(),
-            bytecode,
-            contract,
-            gas: Gas::new(gas_limit),
-            instruction_result: InstructionResult::Continue,
-            function_stack: FunctionStack::default(),
-            is_static,
-            is_eof,
-            is_eof_init: false,
-            return_data_buffer: Bytes::new(),
-            shared_memory: EMPTY_SHARED_MEMORY,
-            stack: Stack::new(),
-            next_action: InterpreterAction::None,
-        }
-    }
-
-    /// Set set is_eof_init to true, this is used to enable `RETURNCONTRACT` opcode.
-    #[inline]
-    pub fn set_is_eof_init(&mut self) {
-        self.is_eof_init = true;
-    }
-
-    #[inline]
-    pub fn eof(&self) -> Option<&Eof> {
-        self.contract.bytecode.eof()
-    }
-
-    /// Test related helper
-    #[cfg(test)]
-    pub fn new_bytecode(bytecode: Bytecode) -> Self {
-        Self::new(
-            Contract::new(
-                Bytes::new(),
-                bytecode,
-                None,
-                crate::primitives::Address::default(),
-                crate::primitives::Address::default(),
-                U256::ZERO,
-            ),
-            0,
-            false,
-        )
-    }
-
-    /// Load EOF code into interpreter. PC is assumed to be correctly set
-    pub(crate) fn load_eof_code(&mut self, idx: usize, pc: usize) {
-        // SAFETY: eof flag is true only if bytecode is Eof.
-        let Bytecode::Eof(eof) = &self.contract.bytecode else {
-            panic!("Expected EOF code section")
-        };
-        let Some(code) = eof.body.code(idx) else {
-            panic!("Code not found")
-        };
-        self.bytecode = code.clone();
-        self.instruction_pointer = unsafe { self.bytecode.as_ptr().add(pc) };
-    }
-
-    /// Inserts the output of a `create` call into the interpreter.
-    ///
-    /// This function is used after a `create` call has been executed. It processes the outcome
-    /// of that call and updates the state of the interpreter accordingly.
-    ///
-    /// # Arguments
-    ///
-    /// * `create_outcome` - A `CreateOutcome` struct containing the results of the `create` call.
-    ///
-    /// # Behavior
-    ///
-    /// The function updates the `return_data_buffer` with the data from `create_outcome`.
-    /// Depending on the `InstructionResult` indicated by `create_outcome`, it performs one of the following:
-    ///
-    /// - `Ok`: Pushes the address from `create_outcome` to the stack, updates gas costs, and records any gas refunds.
-    /// - `Revert`: Pushes `U256::ZERO` to the stack and updates gas costs.
-    /// - `FatalExternalError`: Sets the `instruction_result` to `InstructionResult::FatalExternalError`.
-    /// - `Default`: Pushes `U256::ZERO` to the stack.
-    ///
-    /// # Side Effects
-    ///
-    /// - Updates `return_data_buffer` with the data from `create_outcome`.
-    /// - Modifies the stack by pushing values depending on the `InstructionResult`.
-    /// - Updates gas costs and records refunds in the interpreter's `gas` field.
-    /// - May alter `instruction_result` in case of external errors.
-    pub fn insert_create_outcome(&mut self, create_outcome: CreateOutcome) {
-        self.instruction_result = InstructionResult::Continue;
-
-        let instruction_result = create_outcome.instruction_result();
-        self.return_data_buffer = if instruction_result.is_revert() {
-            // Save data to return data buffer if the create reverted
-            create_outcome.output().to_owned()
-        } else {
-            // Otherwise clear it
-            Bytes::new()
-        };
-
-        match instruction_result {
-            return_ok!() => {
-                let address = create_outcome.address;
-                push_b256!(self, address.unwrap_or_default().into_word());
-                self.gas.erase_cost(create_outcome.gas().remaining());
-                self.gas.record_refund(create_outcome.gas().refunded());
-            }
-            return_revert!() => {
-                push!(self, U256::ZERO);
-                self.gas.erase_cost(create_outcome.gas().remaining());
-            }
-            InstructionResult::FatalExternalError => {
-                panic!("Fatal external error in insert_create_outcome");
-            }
-            _ => {
-                push!(self, U256::ZERO);
-            }
-        }
-    }
-
-    pub fn insert_eofcreate_outcome(&mut self, create_outcome: EOFCreateOutcome) {
-        let instruction_result = create_outcome.instruction_result();
-
-        self.return_data_buffer = if *instruction_result == InstructionResult::Revert {
-            // Save data to return data buffer if the create reverted
-            create_outcome.output().to_owned()
-        } else {
-            // Otherwise clear it. Note that RETURN opcode should abort.
-            Bytes::new()
-        };
-
-        match instruction_result {
-            InstructionResult::ReturnContract => {
-                push_b256!(self, create_outcome.address.into_word());
-                self.gas.erase_cost(create_outcome.gas().remaining());
-                self.gas.record_refund(create_outcome.gas().refunded());
-            }
-            return_revert!() => {
-                push!(self, U256::ZERO);
-                self.gas.erase_cost(create_outcome.gas().remaining());
-            }
-            InstructionResult::FatalExternalError => {
-                panic!("Fatal external error in insert_eofcreate_outcome");
-            }
-            _ => {
-                push!(self, U256::ZERO);
-            }
-        }
-    }
-
-    /// Inserts the outcome of a call into the virtual machine's state.
-    ///
-    /// This function takes the result of a call, represented by `CallOutcome`,
-    /// and updates the virtual machine's state accordingly. It involves updating
-    /// the return data buffer, handling gas accounting, and setting the memory
-    /// in shared storage based on the outcome of the call.
-    ///
-    /// # Arguments
-    ///
-    /// * `shared_memory` - A mutable reference to the shared memory used by the virtual machine.
-    /// * `call_outcome` - The outcome of the call to be processed, containing details such as
-    ///   instruction result, gas information, and output data.
-    ///
-    /// # Behavior
-    ///
-    /// The function first copies the output data from the call outcome to the virtual machine's
-    /// return data buffer. It then checks the instruction result from the call outcome:
-    ///
-    /// - `return_ok!()`: Processes successful execution, refunds gas, and updates shared memory.
-    /// - `return_revert!()`: Handles a revert by only updating the gas usage and shared memory.
-    /// - `InstructionResult::FatalExternalError`: Sets the instruction result to a fatal external error.
-    /// - Any other result: No specific action is taken.
-    pub fn insert_call_outcome(
-        &mut self,
-        shared_memory: &mut SharedMemory,
-        call_outcome: CallOutcome,
-    ) {
-        self.instruction_result = InstructionResult::Continue;
-        self.return_data_buffer.clone_from(call_outcome.output());
-
-        let out_offset = call_outcome.memory_start();
-        let out_len = call_outcome.memory_length();
-
-        let target_len = min(out_len, self.return_data_buffer.len());
-        match call_outcome.instruction_result() {
-            return_ok!() => {
-                // return unspend gas.
-                let remaining = call_outcome.gas().remaining();
-                let refunded = call_outcome.gas().refunded();
-                self.gas.erase_cost(remaining);
-                self.gas.record_refund(refunded);
-                shared_memory.set(out_offset, &self.return_data_buffer[..target_len]);
-                push!(self, U256::from(1));
-            }
-            return_revert!() => {
-                self.gas.erase_cost(call_outcome.gas().remaining());
-                shared_memory.set(out_offset, &self.return_data_buffer[..target_len]);
-                push!(self, U256::ZERO);
-            }
-            InstructionResult::FatalExternalError => {
-                panic!("Fatal external error in insert_call_outcome");
-            }
-            _ => {
-                push!(self, U256::ZERO);
-            }
-        }
-    }
-
-    /// Returns the opcode at the current instruction pointer.
-    #[inline]
+    /// Current opcode
     pub fn current_opcode(&self) -> u8 {
         unsafe { *self.instruction_pointer }
     }
 
-    /// Returns a reference to the contract.
-    #[inline]
+    /// Create new interpreter
+    pub fn new(contract: Contract, gas_limit: u64, is_static: bool) -> Self {
+        #[cfg(not(feature = "memory_limit"))]
+        {
+            Self {
+                instruction_pointer: contract.bytecode.as_ptr(),
+                return_range: Range::default(),
+                memory: Memory::new(),
+                stack: Stack::new(),
+                return_data_buffer: Bytes::new(),
+                contract,
+                instruction_result: InstructionResult::Continue,
+                is_static,
+                gas: Gas::new(gas_limit),
+            }
+        }
+
+        #[cfg(feature = "memory_limit")]
+        {
+            Self::new_with_memory_limit(contract, gas_limit, is_static, u64::MAX)
+        }
+    }
+
+    #[cfg(feature = "memory_limit")]
+    pub fn new_with_memory_limit(
+        contract: Contract,
+        gas_limit: u64,
+        is_static: bool,
+        memory_limit: u64,
+    ) -> Self {
+        Self {
+            instruction_pointer: contract.bytecode.as_ptr(),
+            return_range: Range::default(),
+            memory: Memory::new(),
+            stack: Stack::new(),
+            return_data_buffer: Bytes::new(),
+            contract,
+            instruction_result: InstructionResult::Continue,
+            is_static,
+            gas: Gas::new(gas_limit),
+            memory_limit,
+        }
+    }
+
     pub fn contract(&self) -> &Contract {
         &self.contract
     }
 
-    /// Returns a reference to the interpreter's gas state.
-    #[inline]
     pub fn gas(&self) -> &Gas {
         &self.gas
     }
 
-    /// Returns a reference to the interpreter's stack.
-    #[inline]
+    /// Reference of interpreter memory.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
+    /// Reference of interpreter stack.
     pub fn stack(&self) -> &Stack {
         &self.stack
     }
 
-    /// Returns the current program counter.
-    #[inline]
+    /// Return a reference of the program counter.
     pub fn program_counter(&self) -> usize {
-        // SAFETY: `instruction_pointer` should be at an offset from the start of the bytecode.
-        // In practice this is always true unless a caller modifies the `instruction_pointer` field manually.
-        unsafe { self.instruction_pointer.offset_from(self.bytecode.as_ptr()) as usize }
+        // Safety: this is just subtraction of pointers, it is safe to do.
+        unsafe {
+            self.instruction_pointer
+                .offset_from(self.contract.bytecode.as_ptr()) as usize
+        }
     }
 
-    /// Executes the instruction at the current instruction pointer.
-    ///
-    /// Internally it will increment instruction pointer by one.
-    #[inline]
-    pub(crate) fn step<FN, H: Host + ?Sized>(&mut self, instruction_table: &[FN; 256], host: &mut H)
-    where
-        FN: Fn(&mut Interpreter, &mut H),
-    {
-        // Get current opcode.
+    /// Execute next instruction
+    #[inline(always)]
+    pub fn step<T, H: Host<T>, SPEC: Spec>(&mut self, host: &mut H, additional_data: &mut T) {
+        // step.
         let opcode = unsafe { *self.instruction_pointer };
-
-        // SAFETY: In analysis we are doing padding of bytecode so that we are sure that last
+        // Safety: In analysis we are doing padding of bytecode so that we are sure that last
         // byte instruction is STOP so we are safe to just increment program_counter bcs on last instruction
         // it will do noop and just stop execution of this contract
         self.instruction_pointer = unsafe { self.instruction_pointer.offset(1) };
-
-        // execute instruction.
-        (instruction_table[opcode as usize])(self, host)
+        eval::<T, H, SPEC>(opcode, self, host, additional_data);
     }
 
-    /// Take memory and replace it with empty memory.
-    pub fn take_memory(&mut self) -> SharedMemory {
-        core::mem::replace(&mut self.shared_memory, EMPTY_SHARED_MEMORY)
-    }
-
-    /// Executes the interpreter until it returns or stops.
-    pub fn run<FN, H: Host + ?Sized>(
+    /// loop steps until we are finished with execution
+    pub fn run<T, H: Host<T>, SPEC: Spec>(
         &mut self,
-        shared_memory: SharedMemory,
-        instruction_table: &[FN; 256],
         host: &mut H,
-    ) -> InterpreterAction
-    where
-        FN: Fn(&mut Interpreter, &mut H),
-    {
-        self.next_action = InterpreterAction::None;
-        self.shared_memory = shared_memory;
-        // main loop
+        additional_data: &mut T,
+    ) -> InstructionResult {
         while self.instruction_result == InstructionResult::Continue {
-            self.step(instruction_table, host);
+            self.step::<T, H, SPEC>(host, additional_data);
         }
+        self.instruction_result
+    }
 
-        // Return next action if it is some.
-        if self.next_action.is_some() {
-            return core::mem::take(&mut self.next_action);
+    /// loop steps until we are finished with execution
+    pub fn run_inspect<T, H: Host<T>, SPEC: Spec>(
+        &mut self,
+        host: &mut H,
+        additional_data: &mut T,
+    ) -> InstructionResult {
+        for _count in 0..MAX_INSTRUCTION_SIZE {
+            if self.instruction_result == InstructionResult::Continue {
+                host.step(self, additional_data);
+                self.step::<T, H, SPEC>(host, additional_data);
+            } else {
+                break;
+            }
         }
-        // If not, return action without output as it is a halt.
-        InterpreterAction::Return {
-            result: InterpreterResult {
-                result: self.instruction_result,
-                // return empty bytecode
-                output: Bytes::new(),
-                gas: self.gas,
-            },
+        self.instruction_result
+    }
+
+    /// Copy and get the return value of the interpreter, if any.
+    pub fn return_value(&self) -> Bytes {
+        // if start is usize max it means that our return len is zero and we need to return empty
+        if self.return_range.start == usize::MAX {
+            Bytes::new()
+        } else {
+            Bytes::copy_from_slice(self.memory.get_slice(
+                self.return_range.start,
+                self.return_range.end - self.return_range.start,
+            ))
         }
-    }
-
-    /// Resize the memory to the new size. Returns whether the gas was enough to resize the memory.
-    #[inline]
-    #[must_use]
-    pub fn resize_memory(&mut self, new_size: usize) -> bool {
-        resize_memory(&mut self.shared_memory, &mut self.gas, new_size)
-    }
-}
-
-impl InterpreterResult {
-    /// Returns whether the instruction result is a success.
-    #[inline]
-    pub const fn is_ok(&self) -> bool {
-        self.result.is_ok()
-    }
-
-    /// Returns whether the instruction result is a revert.
-    #[inline]
-    pub const fn is_revert(&self) -> bool {
-        self.result.is_revert()
-    }
-
-    /// Returns whether the instruction result is an error.
-    #[inline]
-    pub const fn is_error(&self) -> bool {
-        self.result.is_error()
-    }
-}
-
-/// Resize the memory to the new size. Returns whether the gas was enough to resize the memory.
-#[inline(never)]
-#[cold]
-#[must_use]
-pub fn resize_memory(memory: &mut SharedMemory, gas: &mut Gas, new_size: usize) -> bool {
-    let new_words = num_words(new_size as u64);
-    let new_cost = gas::memory_gas(new_words);
-    let current_cost = memory.current_expansion_cost();
-    let cost = new_cost - current_cost;
-    let success = gas.record_cost(cost);
-    if success {
-        memory.resize((new_words as usize) * 32);
-    }
-    success
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{opcode::InstructionTable, DummyHost};
-    use revm_primitives::CancunSpec;
-
-    #[test]
-    fn object_safety() {
-        let mut interp = Interpreter::new(Contract::default(), u64::MAX, false);
-
-        let mut host = crate::DummyHost::default();
-        let table: InstructionTable<DummyHost> =
-            crate::opcode::make_instruction_table::<DummyHost, CancunSpec>();
-        let _ = interp.run(EMPTY_SHARED_MEMORY, &table, &mut host);
-
-        let host: &mut dyn Host = &mut host as &mut dyn Host;
-        let table: InstructionTable<dyn Host> =
-            crate::opcode::make_instruction_table::<dyn Host, CancunSpec>();
-        let _ = interp.run(EMPTY_SHARED_MEMORY, &table, host);
     }
 }

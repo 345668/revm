@@ -1,46 +1,41 @@
-//! # revm-primitives
-//!
-//! EVM primitive types.
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(not(feature = "std"))]
-extern crate alloc as std;
-
-mod bytecode;
-mod constants;
+pub mod bits;
+pub mod bytecode;
+pub mod constants;
 pub mod db;
 pub mod env;
-
-#[cfg(feature = "c-kzg")]
-pub mod kzg;
+pub mod log;
 pub mod precompile;
 pub mod result;
 pub mod specification;
 pub mod state;
 pub mod utilities;
-pub use alloy_primitives::{
-    self, address, b256, bytes, fixed_bytes, hex, hex_literal, ruint, uint, Address, Bytes,
-    FixedBytes, Log, LogData, B256, I256, U256,
-};
+
+extern crate alloc;
+
+pub use bits::B160;
+pub use bits::B256;
+pub use bytes;
+pub use bytes::Bytes;
+pub use hex;
+pub use hex_literal;
+/// Address type is last 20 bytes of hash of ethereum account
+pub type Address = B160;
+/// Hash, in Ethereum usually keccak256.
+pub type Hash = B256;
+
 pub use bitvec;
 pub use bytecode::*;
 pub use constants::*;
 pub use env::*;
-
-cfg_if::cfg_if! {
-    if #[cfg(all(not(feature = "hashbrown"), feature = "std"))] {
-        pub use std::collections::{hash_map, hash_set, HashMap, HashSet};
-        use hashbrown as _;
-    } else {
-        pub use hashbrown::{hash_map, hash_set, HashMap, HashSet};
-    }
-}
-
-#[cfg(feature = "c-kzg")]
-pub use kzg::{EnvKzgSettings, KzgSettings};
+pub use hashbrown::{hash_map, hash_set, HashMap, HashSet};
+pub use log::Log;
 pub use precompile::*;
 pub use result::*;
+pub use ruint;
+pub use ruint::aliases::U256;
+pub use ruint::uint;
 pub use specification::*;
 pub use state::*;
 pub use utilities::*;

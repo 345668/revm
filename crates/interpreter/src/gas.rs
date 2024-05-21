@@ -1,133 +1,91 @@
-//! EVM gas calculation utilities.
-
 mod calc;
 mod constants;
 
 pub use calc::*;
 pub use constants::*;
 
-/// Represents the state of gas during execution.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug)]
 pub struct Gas {
-    /// The initial gas limit. This is constant throughout execution.
+    /// Gas Limit
     limit: u64,
-    /// The remaining gas.
-    remaining: u64,
-    /// Refunded gas. This is used only at the end of execution.
+    /// used+memory gas.
+    all_used_gas: u64,
+    /// Used gas without memory
+    used: u64,
+    /// Used gas for memory expansion
+    memory: u64,
+    /// Refunded gas. This gas is used only at the end of execution.
     refunded: i64,
 }
-
 impl Gas {
-    /// Creates a new `Gas` struct with the given gas limit.
-    #[inline]
-    pub const fn new(limit: u64) -> Self {
+    pub fn new(limit: u64) -> Self {
         Self {
             limit,
-            remaining: limit,
+            used: 0,
+            memory: 0,
             refunded: 0,
+            all_used_gas: 0,
         }
     }
 
-    /// Creates a new `Gas` struct with the given gas limit, but without any gas remaining.
-    #[inline]
-    pub const fn new_spent(limit: u64) -> Self {
-        Self {
-            limit,
-            remaining: 0,
-            refunded: 0,
-        }
-    }
-
-    /// Returns the gas limit.
-    #[inline]
-    pub const fn limit(&self) -> u64 {
+    pub fn limit(&self) -> u64 {
         self.limit
     }
 
-    /// Returns the **last** memory expansion cost.
-    #[inline]
-    #[deprecated = "memory expansion cost is not tracked anymore; \
-                    calculate it using `SharedMemory::current_expansion_cost` instead"]
-    #[doc(hidden)]
-    pub const fn memory(&self) -> u64 {
-        0
+    pub fn memory(&self) -> u64 {
+        self.memory
     }
 
-    /// Returns the total amount of gas that was refunded.
-    #[inline]
-    pub const fn refunded(&self) -> i64 {
+    pub fn refunded(&self) -> i64 {
         self.refunded
     }
 
-    /// Returns the total amount of gas spent.
-    #[inline]
-    pub const fn spent(&self) -> u64 {
-        self.limit - self.remaining
+    pub fn spend(&self) -> u64 {
+        self.all_used_gas
     }
 
-    #[doc(hidden)]
-    #[inline]
-    #[deprecated(note = "use `spent` instead")]
-    pub const fn spend(&self) -> u64 {
-        self.spent()
+    pub fn remaining(&self) -> u64 {
+        self.limit - self.all_used_gas
     }
 
-    /// Returns the amount of gas remaining.
-    #[inline]
-    pub const fn remaining(&self) -> u64 {
-        self.remaining
-    }
-
-    /// Erases a gas cost from the totals.
-    #[inline]
     pub fn erase_cost(&mut self, returned: u64) {
-        self.remaining += returned;
+        self.used -= returned;
+        self.all_used_gas -= returned;
     }
 
-    /// Spends all remaining gas.
-    #[inline]
-    pub fn spend_all(&mut self) {
-        self.remaining = 0;
-    }
-
-    /// Records a refund value.
-    ///
-    /// `refund` can be negative but `self.refunded` should always be positive
-    /// at the end of transact.
-    #[inline]
     pub fn record_refund(&mut self, refund: i64) {
         self.refunded += refund;
     }
 
-    /// Set a refund value for final refund.
-    ///
-    /// Max refund value is limited to Nth part (depending of fork) of gas spend.
-    ///
-    /// Related to EIP-3529: Reduction in refunds
-    #[inline]
-    pub fn set_final_refund(&mut self, is_london: bool) {
-        let max_refund_quotient = if is_london { 5 } else { 2 };
-        self.refunded = (self.refunded() as u64).min(self.spent() / max_refund_quotient) as i64;
-    }
-
-    /// Set a refund value. This overrides the current refund value.
-    #[inline]
-    pub fn set_refund(&mut self, refund: i64) {
-        self.refunded = refund;
-    }
-
-    /// Records an explicit cost.
-    ///
-    /// Returns `false` if the gas limit is exceeded.
-    #[inline]
-    #[must_use = "prefer using `gas!` instead to return an out-of-gas error on failure"]
+    /// Record an explicit cost.
+    #[inline(always)]
     pub fn record_cost(&mut self, cost: u64) -> bool {
-        let (remaining, overflow) = self.remaining.overflowing_sub(cost);
-        let success = !overflow;
-        if success {
-            self.remaining = remaining;
+        let (all_used_gas, overflow) = self.all_used_gas.overflowing_add(cost);
+        if overflow || self.limit < all_used_gas {
+            return false;
         }
-        success
+
+        self.used += cost;
+        self.all_used_gas = all_used_gas;
+        true
+    }
+
+    /// used in memory_resize! macro to record gas used for memory expansion.
+    pub fn record_memory(&mut self, gas_memory: u64) -> bool {
+        if gas_memory > self.memory {
+            let (all_used_gas, overflow) = self.used.overflowing_add(gas_memory);
+            if overflow || self.limit < all_used_gas {
+                return false;
+            }
+            self.memory = gas_memory;
+            self.all_used_gas = all_used_gas;
+        }
+        true
+    }
+
+    /// used in gas_refund! macro to record refund value.
+    /// Refund can be negative but self.refunded is always positive.
+    pub fn gas_refund(&mut self, refund: i64) {
+        self.refunded += refund;
     }
 }

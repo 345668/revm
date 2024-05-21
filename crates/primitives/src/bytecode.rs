@@ -1,168 +1,160 @@
-pub mod eof;
-pub mod legacy;
+use crate::{keccak256, B256, KECCAK_EMPTY};
+use alloc::{sync::Arc, vec, vec::Vec};
+use bitvec::prelude::{bitvec, Lsb0};
+use bitvec::vec::BitVec;
+use bytes::Bytes;
 
-pub use eof::Eof;
-pub use legacy::{JumpTable, LegacyAnalyzedBytecode};
-
-use crate::{keccak256, Bytes, B256, KECCAK_EMPTY};
-
-/// State of the [`Bytecode`] analysis.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A map of valid `jump` destinations.
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Bytecode {
-    /// No analysis has been performed.
-    LegacyRaw(Bytes),
-    /// The bytecode has been analyzed for valid jump destinations.
-    LegacyAnalyzed(LegacyAnalyzedBytecode),
-    /// Ethereum Object Format
-    Eof(Eof),
+pub struct JumpMap(pub Arc<BitVec<u8>>);
+
+impl JumpMap {
+    /// Get the raw bytes of the jump map
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_raw_slice()
+    }
+
+    /// Construct a jump map from raw bytes
+    pub fn from_slice(slice: &[u8]) -> Self {
+        Self(Arc::new(BitVec::from_slice(slice)))
+    }
+
+    /// Check if `pc` is a valid jump destination.
+    pub fn is_valid(&self, pc: usize) -> bool {
+        pc < self.0.len() && self.0[pc]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BytecodeState {
+    Raw,
+    Checked { len: usize },
+    Analysed { len: usize, jump_map: JumpMap },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Bytecode {
+    #[cfg_attr(feature = "serde", serde(with = "crate::utilities::serde_hex_bytes"))]
+    pub bytecode: Bytes,
+    pub hash: B256,
+    pub state: BytecodeState,
 }
 
 impl Default for Bytecode {
-    #[inline]
     fn default() -> Self {
-        // Creates a new legacy analyzed [`Bytecode`] with exactly one STOP opcode.
-        Self::new()
+        Bytecode::new()
     }
 }
 
 impl Bytecode {
-    // Creates a new legacy analyzed [`Bytecode`] with exactly one STOP opcode.
-    #[inline]
+    /// Create [`Bytecode`] with one STOP opcode.
     pub fn new() -> Self {
-        Self::LegacyAnalyzed(LegacyAnalyzedBytecode::default())
-    }
-
-    /// Return jump table if bytecode is analyzed
-    #[inline]
-    pub fn legacy_jump_table(&self) -> Option<&JumpTable> {
-        match &self {
-            Self::LegacyAnalyzed(analyzed) => Some(analyzed.jump_table()),
-            _ => None,
+        Bytecode {
+            bytecode: vec![0].into(),
+            hash: KECCAK_EMPTY,
+            state: BytecodeState::Analysed {
+                len: 0,
+                jump_map: JumpMap(Arc::new(bitvec![u8, Lsb0; 0])),
+            },
         }
     }
 
-    /// Calculate hash of the bytecode.
-    pub fn hash_slow(&self) -> B256 {
-        if self.is_empty() {
+    pub fn new_raw(bytecode: Bytes) -> Self {
+        let hash = if bytecode.is_empty() {
             KECCAK_EMPTY
         } else {
-            keccak256(self.original_byte_slice())
+            keccak256(&bytecode)
+        };
+        Self {
+            bytecode,
+            hash,
+            state: BytecodeState::Raw,
         }
     }
 
-    /// Return reference to the EOF if bytecode is EOF.
-    #[inline]
-    pub const fn eof(&self) -> Option<&Eof> {
-        match self {
-            Self::Eof(eof) => Some(eof),
-            _ => None,
-        }
-    }
-
-    /// Return true if bytecode is EOF.
-    #[inline]
-    pub const fn is_eof(&self) -> bool {
-        matches!(self, Self::Eof(_))
-    }
-
-    /// Creates a new raw [`Bytecode`].
-    #[inline]
-    pub fn new_raw(bytecode: Bytes) -> Self {
-        Self::LegacyRaw(bytecode)
-    }
-
-    /// Create new checked bytecode.
+    /// Create new raw Bytecode with hash
     ///
     /// # Safety
-    ///
-    /// Bytecode needs to end with STOP (0x00) opcode as checked bytecode assumes
-    /// that it is safe to iterate over bytecode without checking lengths.
-    pub unsafe fn new_analyzed(
-        bytecode: Bytes,
-        original_len: usize,
-        jump_table: JumpTable,
-    ) -> Self {
-        Self::LegacyAnalyzed(LegacyAnalyzedBytecode::new(
+    /// Hash need to be appropriate keccak256 over bytecode.
+    pub unsafe fn new_raw_with_hash(bytecode: Bytes, hash: B256) -> Self {
+        Self {
             bytecode,
-            original_len,
-            jump_table,
-        ))
+            hash,
+            state: BytecodeState::Raw,
+        }
     }
 
-    /// Returns a reference to the bytecode.
+    /// Create new checked bytecode
     ///
-    /// In case of EOF this will be the first code section.
-    #[inline]
-    pub fn bytecode(&self) -> &Bytes {
-        match self {
-            Self::LegacyRaw(bytes) => bytes,
-            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode(),
-            Self::Eof(eof) => eof
-                .body
-                .code(0)
-                .expect("Valid EOF has at least one code section"),
+    /// # Safety
+    /// Bytecode need to end with STOP (0x00) opcode as checked bytecode assumes
+    /// that it is safe to iterate over bytecode without checking lengths
+    pub unsafe fn new_checked(bytecode: Bytes, len: usize, hash: Option<B256>) -> Self {
+        let hash = match hash {
+            None if len == 0 => KECCAK_EMPTY,
+            None => keccak256(&bytecode),
+            Some(hash) => hash,
+        };
+        Self {
+            bytecode,
+            hash,
+            state: BytecodeState::Checked { len },
         }
     }
 
-    /// Returns false if bytecode can't be executed in Interpreter.
-    pub fn is_execution_ready(&self) -> bool {
-        !matches!(self, Self::LegacyRaw(_))
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytecode
     }
 
-    /// Returns bytes
-    #[inline]
-    pub fn bytes(&self) -> Bytes {
-        match self {
-            Self::LegacyRaw(bytes) => bytes.clone(),
-            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode().clone(),
-            Self::Eof(eof) => eof.raw().clone(),
-        }
-    }
-
-    /// Returns bytes slice
-    #[inline]
-    pub fn bytes_slice(&self) -> &[u8] {
-        match self {
-            Self::LegacyRaw(bytes) => bytes,
-            Self::LegacyAnalyzed(analyzed) => analyzed.bytecode(),
-            Self::Eof(eof) => eof.raw(),
-        }
-    }
-
-    /// Returns a reference to the original bytecode.
-    #[inline]
     pub fn original_bytes(&self) -> Bytes {
-        match self {
-            Self::LegacyRaw(bytes) => bytes.clone(),
-            Self::LegacyAnalyzed(analyzed) => analyzed.original_bytes(),
-            Self::Eof(eof) => eof.raw().clone(),
+        match self.state {
+            BytecodeState::Raw => self.bytecode.clone(),
+            BytecodeState::Checked { len } | BytecodeState::Analysed { len, .. } => {
+                self.bytecode.slice(0..len)
+            }
         }
     }
 
-    /// Returns the original bytecode as a byte slice.
-    #[inline]
-    pub fn original_byte_slice(&self) -> &[u8] {
-        match self {
-            Self::LegacyRaw(bytes) => bytes,
-            Self::LegacyAnalyzed(analyzed) => analyzed.original_byte_slice(),
-            Self::Eof(eof) => eof.raw(),
-        }
+    pub fn hash(&self) -> B256 {
+        self.hash
     }
 
-    /// Returns the length of the raw bytes.
-    #[inline]
-    pub fn len(&self) -> usize {
-        match self {
-            Self::LegacyRaw(bytes) => bytes.len(),
-            Self::LegacyAnalyzed(analyzed) => analyzed.original_len(),
-            Self::Eof(eof) => eof.size(),
-        }
+    pub fn state(&self) -> &BytecodeState {
+        &self.state
     }
 
-    /// Returns whether the bytecode is empty.
-    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match self.state {
+            BytecodeState::Raw => self.bytecode.is_empty(),
+            BytecodeState::Checked { len } => len == 0,
+            BytecodeState::Analysed { len, .. } => len == 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self.state {
+            BytecodeState::Raw => self.bytecode.len(),
+            BytecodeState::Checked { len, .. } => len,
+            BytecodeState::Analysed { len, .. } => len,
+        }
+    }
+
+    pub fn to_checked(self) -> Self {
+        match self.state {
+            BytecodeState::Raw => {
+                let len = self.bytecode.len();
+                let mut bytecode: Vec<u8> = Vec::from(self.bytecode.as_ref());
+                bytecode.resize(len + 33, 0);
+                Self {
+                    bytecode: bytecode.into(),
+                    hash: self.hash,
+                    state: BytecodeState::Checked { len },
+                }
+            }
+            _ => self,
+        }
     }
 }

@@ -1,56 +1,33 @@
-//! Revm is a Rust EVM implementation.
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(not(feature = "std"), no_std)]
-
-#[macro_use]
-#[cfg(not(feature = "std"))]
-extern crate alloc as std;
-
-// Define modules.
-
-mod builder;
-mod context;
-
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
 
 pub mod db;
 mod evm;
-mod frame;
-pub mod handler;
+mod evm_impl;
 mod inspector;
 mod journaled_state;
-#[cfg(feature = "optimism")]
-pub mod optimism;
 
-// Export items.
+#[cfg(all(feature = "with-serde", not(feature = "serde")))]
+compile_error!("`with-serde` feature has been renamed to `serde`.");
 
-pub use builder::EvmBuilder;
-pub use context::{
-    Context, ContextPrecompile, ContextPrecompiles, ContextStatefulPrecompile,
-    ContextStatefulPrecompileArc, ContextStatefulPrecompileBox, ContextStatefulPrecompileMut,
-    ContextWithHandlerCfg, EvmContext, InnerEvmContext,
-};
-pub use db::{
-    CacheState, DBBox, State, StateBuilder, StateDBBox, TransitionAccount, TransitionState,
-};
-pub use db::{Database, DatabaseCommit, DatabaseRef, InMemoryDB};
-pub use evm::{Evm, CALL_STACK_LIMIT};
-pub use frame::{CallFrame, CreateFrame, Frame, FrameData, FrameOrResult, FrameResult};
-pub use handler::Handler;
-pub use inspector::{
-    inspector_handle_register, inspector_instruction, inspectors, GetInspector, Inspector,
-};
-pub use journaled_state::{JournalCheckpoint, JournalEntry, JournaledState};
-// export Optimism types, helpers, and constants
-#[cfg(feature = "optimism")]
-pub use optimism::{L1BlockInfo, BASE_FEE_RECIPIENT, L1_BLOCK_CONTRACT, L1_FEE_RECIPIENT};
+pub(crate) const USE_GAS: bool = !cfg!(feature = "no_gas_measuring");
+pub type DummyStateDB = InMemoryDB;
 
-// Reexport libraries
+pub use db::{Database, DatabaseCommit, InMemoryDB};
+pub use evm::{evm_inner, new, EVM};
+pub use evm_impl::EVMData;
+pub use journaled_state::{JournalEntry, JournaledState};
 
-#[doc(inline)]
-pub use revm_interpreter as interpreter;
-#[doc(inline)]
-pub use revm_interpreter::primitives;
-#[doc(inline)]
+extern crate alloc;
+
+/// reexport `revm_precompiles`
 pub use revm_precompile as precompile;
+
+// reexport `revm_interpreter`
+pub use revm_interpreter as interpreter;
+
+// reexport `revm_primitives`
+pub use revm_interpreter::primitives;
+
+/// Reexport Inspector implementations
+pub use inspector::inspectors;
+pub use inspector::Inspector;
